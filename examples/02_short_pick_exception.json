@@ -1,0 +1,20 @@
+{
+  "_entry_point": "order_placed",
+  "_description": "Over-demand on a short-stocked seeded SKU (avail 1 < 5) — allocation's deterministic AVAILABILITY GATE fires, blanks the picker dispatch, and routes the short line to exception_agent → supervisor.",
+  "order": {
+    "order_id": "ORD-4490",
+    "customer_id": "CUST-Lee-Austin",
+    "ship_method": "express_overnight",
+    "line_items": [
+      {
+        "sku": "SKU-7700",
+        "quantity": 5
+      }
+    ],
+    "ship_to": {
+      "country": "US",
+      "state": "TX",
+      "postal_code": "78701"
+    }
+  }
+}

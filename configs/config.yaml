@@ -1,0 +1,1012 @@
+# warehouse-supply-chain — Warehouse / Supply Chain (with humanoid integration)
+#
+# order → allocate+route (one agent) → pick (humanoid) → inspect →
+# pack → ship. Introduces the FOURTH actor kind (humanoid) for
+# physical work — allocation/inventory/exception agents react to the
+# same events as their humanoid counterparts (picker/inspector/loader).
+#
+# WHY LEAFMESH — supply × goods, COGS, cost, pool 16% revenue,
+# routine 75%, internal visibility. Replenishment runs on people
+# watching dashboards; agents absorb the routine and ACT.
+# Humanoids ($3-8/hr projected) do the physical share.
+#
+# CONFIG-AS-DEPARTMENT — this file casts the roles and carries the
+# wire policy; the DEPTH lives in agency/. The fulfilment chain and the
+# rule-bearing agents are self-reliant: @pre_compose pulls their own
+# context from a seeded dev store (agency/_shared/store.py), @chain
+# enforces deterministic floors the LLM can't waive (availability gate,
+# shrink threshold, carrier rate-shop rule, ship-readiness), and the
+# humanoid actors run real task-dispatch actuators with idempotency.
+# Pure MCP connectors (inventory/returns/replenishment) name the system
+# of record; the two judgment roles are pure-YAML LLM. On-hand counts
+# live in your WMS, carrier rates in your TMS, reorder points in your
+# ERP, robot telemetry in your fleet API — each store-grounded agent
+# documents its PROD swap. Day-0 the whole chain runs with no connectors.
+
+name: "warehouse-supply-chain"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 604800
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+
+  prompt: |
+    This mesh runs warehouse operations: order picking, packing,
+    shipping, returns, cycle-counting. A successful order:
+      - allocation_agent picks the right pick path AND sequences the
+        travel-minimised pick route in the same step
+      - inventory_agent confirms stock + reserves
+      - humanoid (or human) picks
+      - inspection (humanoid + agent) verifies
+      - packer humanoid packs
+      - loader humanoid loads to outbound dock
+
+    Escalate when:
+      - exception_agent flags damage / short-pick / wrong-item
+      - safety event during humanoid operation
+      - cycle-count variance > 2% on any SKU
+      - returns spike > 3 sigma on any SKU
+
+    Watch for:
+      - chronic pick-path issues by zone
+      - humanoid downtime patterns
+      - shipment-delay patterns by carrier
+
+  routing:
+    mode: "learning"
+    memory_size: 250
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "warehouse_runbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "warehouse_manager_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{order_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_WAREHOUSE_CHANNEL:}"
+        message_template: "[warehouse] {{message}} — order {{order_id}}"
+
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+data_structures:
+  OrderEvent:
+    type: "object"
+    properties:
+      order_id: { type: "string" }
+      customer_id: { type: "string" }
+      line_items: { type: "list" }       # [{sku, quantity}]
+      ship_to: { type: "object" }
+      ship_method: { type: "string" }
+      received_at_utc: { type: "string" }
+    required: ["order_id", "line_items"]
+
+entry_points:
+  - name: "order_placed"
+    target: "allocation_agent"
+    description: "OMS order webhook"
+
+  - name: "return_received"
+    target: "returns_handler_agent"
+    description: "Returned item arrives at warehouse"
+
+  - name: "restock_event"
+    target: "inventory_agent"
+    description: "Inbound restock — update inventory"
+
+  - name: "cycle_count_scheduled"
+    target: "inventory_control_agent"
+    description: "Daily cycle-count sweep (mode: count)"
+
+  - name: "humanoid_status"
+    target: "humanoid_status_agent"
+    description: "Humanoid telemetry event (battery / fault / location)"
+
+  - name: "manual_action"
+    target: "allocation_agent"
+    description: "Operator-triggered action"
+
+  - name: "sku_master_update"
+    target: "replenishment_planner_agent"
+    description: "Set or adjust one SKU's on-hand qty / reorder thresholds"
+
+  - name: "reorder_sweep"
+    target: "replenishment_planner_agent"
+    description: "Sweep all SKUs and surface reorder recommendations"
+
+  - name: "cycle_count_ingest"
+    target: "inventory_control_agent"
+    description: "Record one physical-count result (mode: ingest)"
+
+  - name: "inventory_recon"
+    target: "inventory_control_agent"
+    description: "Reconcile physical counts vs system; flag systematic shrink (mode: report)"
+
+  - name: "carrier_select"
+    target: "carrier_selector_agent"
+    description: "Packed carton ready — pick cheapest carrier meeting SLA"
+
+  - name: "bulk_rate_renegotiation"
+    target: "carrier_selector_agent"
+    description: "Quarterly rate review — re-cost the carton mix against new tables"
+
+  - name: "carrier_outage_failover"
+    target: "carrier_selector_agent"
+    description: "Primary carrier outage — fail over to next-cheapest meeting SLA"
+
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_allocation"
+    target: "allocation_agent"
+    description: "On-demand direct call to allocation (programmatic; also computes the pick route) — bypasses upstream chain"
+
+  - name: "direct_call_exception"
+    target: "exception_agent"
+    description: "On-demand direct call to exception (llm) — bypasses upstream chain"
+
+  - name: "direct_call_picker"
+    target: "picker_humanoid"
+    description: "On-demand direct call to picker (programmatic) — bypasses upstream chain"
+
+  - name: "direct_call_inspection"
+    target: "inspection_humanoid"
+    description: "On-demand direct call to inspection (programmatic) — bypasses upstream chain"
+
+  - name: "direct_call_packer"
+    target: "packer_humanoid"
+    description: "On-demand direct call to packer (programmatic) — bypasses upstream chain"
+
+  - name: "direct_call_loader"
+    target: "loader_humanoid"
+    description: "On-demand direct call to loader (programmatic) — bypasses upstream chain"
+
+  # ── Supplier relationship management (2.3.x ROLE consolidation:
+  #    one supplier_relations_agent, three responsibilities) ──
+  - name: "supplier_relations_onboarding"
+    target: "supplier_relations_agent"
+    description: "Update / approve a supplier's onboarding state (KYC/tax/banking/ESG/integration) (mode: onboarding)"
+
+  - name: "supplier_relations_sourcing"
+    target: "supplier_relations_agent"
+    description: "Find qualified alternates for a SKU/category (esg floor + lead-time/reliability scoring) (mode: sourcing)"
+
+  - name: "supplier_quarterly_scorecard"
+    target: "supplier_relations_agent"
+    description: "Quarterly scorecard aggregation across all suppliers (mode: scorecard)"
+
+
+agents:
+
+  # ────────────────────────────────────────────────────────────
+  # allocation_agent — absorbed the routing stage (2.3.x
+  # consolidation): allocates pick path / batching / priority AND
+  # computes the travel-minimised pick route in one sequential
+  # programmatic step, then dispatches the picker while
+  # inventory_agent reserves stock in parallel (a shortage surfaces
+  # as a short-pick exception).
+  # ────────────────────────────────────────────────────────────
+  allocation_agent:
+    name: "allocation_agent"
+    agent_type: "programmatic"
+    description: "Pick path, batching, priority + travel-minimised pick route"
+    communication_type: "chain"
+
+    yields:
+      pick_plan: "list"                  # [{sku, qty, zone, bin}]
+      batch_id: "string"
+      priority: "string"                 # standard | rush | hazmat
+      requires_special_handling: "boolean"
+      pick_sequence: "list"              # ordered [{bin, sku, qty}]
+      estimated_minutes: "number"
+      assigned_resource: "string"        # picker_humanoid | human_picker | "" (gated)
+      order_id: "string"                 # Identity passthrough — manager sees WHICH order
+      all_available: "boolean"           # @chain availability gate verdict
+      short_lines: "list"                # [{sku, requested, available}] — gated lines
+
+    inputs:
+      order: "object"
+      pick_plan: "list"                  # direct-call path — route an existing plan
+
+    can_call:
+      - agent: "inventory_agent"
+
+      # AVAILABILITY GATE (deterministic @chain floor in
+      # agency/_shared/allocation_math): a short order surfaces as a
+      # short-pick exception and the picker is NOT dispatched.
+      - agent: "exception_agent"
+        condition: "calling_agent_response.all_available == false"
+
+      - agent: "picker_humanoid"
+        condition: "calling_agent_response.assigned_resource == 'picker_humanoid' and calling_agent_response.all_available == true"
+
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.assigned_resource == 'human_picker'"
+
+  inventory_agent:
+    name: "inventory_agent"
+    agent_type: "programmatic"
+    description: "Confirms stock + reserves units in your WMS"
+    communication_type: "dual"           # can call exception AND allocation peer-to-peer
+
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # On-hand counts and reservations live in your WMS, not in this
+    # template. Point this connector at an MCP gateway (or swap
+    # integration to n8n/zapier) that returns the yields below.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${WMS_MCP_URL:}"            # your WMS gateway (Manhattan, Blue Yonder, NetSuite WMS, ...)
+      tool_name: "check_and_reserve_stock"   # must return the yields below
+      timeout: 30
+
+    yields:   # ← contract your WMS connector must return
+      all_in_stock: "boolean"
+      short_skus: "list"                 # [{sku, requested, available}]
+      reservation_id: "string"
+
+    inputs:
+      pick_plan: "list"
+
+    can_call:
+      # Stock available → reservation holds; the picker was already
+      # dispatched by allocation_agent (which also computes the route).
+
+      # Shortage → exception
+      - agent: "exception_agent"
+        condition: "calling_agent_response.all_in_stock == false"
+
+  # ── DEEP (agency/exception_agent.py) — store-grounded LLM with a
+  # deterministic severity/safety floor. @pre_compose load_exception_context
+  # pulls the order + the affected SKU's inventory (unit VALUE, bin, free
+  # stock) + the fleet unit BEFORE the LLM classifies, so it reasons over
+  # facts (e.g. the damaged SKU is a $649 item) not a one-line note.
+  # @chain enforce_severity_floor re-asserts the floors the LLM can't
+  # waive: a safety event, ANY damage, OR a high-value line (≥ $500)
+  # forces requires_supervisor + escalate and floors severity — and the
+  # wire conditions below gate on the SAME verdict so they hold even if
+  # the model under-scores. floor_reason records WHY the floor fired. ──
+  exception_agent:
+    name: "exception_agent"
+    agent_type: "llm"
+    description: "Short-pick / damage / wrong-item / safety event handler"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 800
+    communication_type: "chain"
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"exception_type": "", "severity": 0, "recommended_action": "", "requires_supervisor": false, "supervisor_briefing": "", "order_id": "", "floor_reason": ""}
+      Classify the warehouse exception. Return JSON with these keys:
+        - "exception_type": short_pick | damage | wrong_item | safety
+          (exactly one of those four; if genuinely ambiguous, use
+          short_pick)
+        - "severity": 0..1
+        - "recommended_action": substitute_sku | backorder | refund |
+          escalate
+        - "requires_supervisor": boolean
+        - "supervisor_briefing": 2-3 sentence narrative for the ops
+          supervisor reading this on the floor. Never empty. Lead
+          with the exception type + severity, name the affected
+          SKU/order if known, recommend the first action. Optimised
+          for fast read on a mobile/tablet on the warehouse floor.
+        - "order_id": echo the order id from the upstream payload
+          unchanged ("" if none is present) — identity passthrough so
+          the supervisor sees WHICH order.
+        - "floor_reason": leave "". This field is OWNED by the
+          deterministic severity floor (agency/exception_agent.py) — it
+          records WHY the floor escalated (safety_event / damage /
+          high_value); never set it yourself.
+
+      Hard rules (non-negotiable policy — the @chain severity floor and
+      the wires enforce the SAME verdict, so you cannot waive them):
+        - Any safety event: "severity" = 1.0, "requires_supervisor" =
+          true, "recommended_action" = "escalate". Always.
+        - Any damage event: not front-line-resolvable —
+          "requires_supervisor" = true, "recommended_action" =
+          "escalate". (The floor re-asserts this even if you under-score.)
+        - A high-value line (the floor knows the unit value from the WMS):
+          a short/damage on a $500+ item escalates to the supervisor.
+        - "severity" >= 0.7: "requires_supervisor" = true,
+          "recommended_action" = "escalate".
+        - Below 0.7, non-safety, non-damage, not high-value: front-line
+          resolvable — "requires_supervisor" = false unless the playbook
+          says otherwise.
+
+    narration: >
+      If the briefing suggests a chronic pattern (the same zone, SKU
+      or picker recurring across recent exceptions), consider
+      warehouse_manager_human in addition to the supervisor. If the
+      damage clearly originates with inbound supplier goods rather
+      than warehouse handling, consider supplier_relations_agent.
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "exception_playbook"
+
+    yields:
+      exception_type: "string"
+      severity: "number"
+      recommended_action: "string"
+      requires_supervisor: "boolean"
+      supervisor_briefing: "string"
+      order_id: "string"                 # Identity passthrough — supervisor sees WHICH order
+      floor_reason: "string"             # @chain severity floor — why it escalated (safety/damage/high_value)
+
+    inputs:
+      upstream_yields: "object"
+      order_id: "string"
+      sku: "string"
+      unit_id: "string"
+
+    can_call:
+      # Deterministic floors (mirrors the prompt's hard rules): safety
+      # OR severity ≥ 0.7 OR the model's own supervisor flag → floor
+      # supervisor, no exceptions.
+      - agent: "ops_supervisor_human"
+        condition: "calling_agent_response.requires_supervisor == true or calling_agent_response.severity >= 0.7 or calling_agent_response.exception_type == 'safety'"
+
+      # Front-line-resolvable exceptions land in the WORM audit only.
+      - agent: "warehouse_audit_logger_agent"
+        condition: "calling_agent_response.severity < 0.7 and calling_agent_response.requires_supervisor == false and calling_agent_response.exception_type != 'safety'"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  picker_humanoid:
+    name: "picker_humanoid"
+    agent_type: "programmatic"           # programmatic dispatcher to physical robot fleet
+    description: "Humanoid picker — physical pick from bins (projected $3-8/hr)"
+    communication_type: "chain"
+
+    yields:
+      pick_status: "string"              # picked | short | damaged | aborted
+      picked_units: "number"
+      damage_flag: "boolean"
+      picker_id: "string"
+
+    inputs:
+      pick_sequence: "list"
+      assigned_resource: "string"
+
+    can_call:
+      # Damage / short → inspection humanoid + exception agent in parallel
+      - agent: "inspection_humanoid"
+        condition: "calling_agent_response.damage_flag == true"
+
+      - agent: "exception_agent"
+        condition: "calling_agent_response.pick_status != 'picked'"
+
+      # Clean pick → packer humanoid
+      - agent: "packer_humanoid"
+        condition: "calling_agent_response.pick_status == 'picked'"
+
+  inspection_humanoid:
+    name: "inspection_humanoid"
+    agent_type: "programmatic"
+    description: "Humanoid inspector — verifies condition of flagged items"
+    communication_type: "chain"
+
+    yields:
+      inspection_result: "string"        # pass | fail | indeterminate
+      condition_notes: "list"
+      safe_to_ship: "boolean"
+
+    inputs:
+      pick_status: "string"
+
+    can_call:
+      - agent: "packer_humanoid"
+        condition: "calling_agent_response.safe_to_ship == true"
+
+      - agent: "exception_agent"
+        condition: "calling_agent_response.safe_to_ship == false"
+
+  packer_humanoid:
+    name: "packer_humanoid"
+    agent_type: "programmatic"
+    description: "Humanoid packer — packs picked items into shipping carton"
+    communication_type: "chain"
+
+    yields:
+      carton_id: "string"
+      weight_kg: "number"
+      packed: "boolean"
+
+    inputs:
+      picked_units: "number"
+
+    can_call:
+      - agent: "loader_humanoid"
+        condition: "calling_agent_response.packed == true"
+
+  loader_humanoid:
+    name: "loader_humanoid"
+    agent_type: "programmatic"
+    description: "Humanoid loader — loads cartons onto outbound trucks"
+    communication_type: "chain"
+
+    yields:
+      truck_id: "string"
+      loaded_at_utc: "string"
+      loaded: "boolean"
+
+    inputs:
+      carton_id: "string"
+
+    can_call:
+      - agent: "warehouse_audit_logger_agent"
+
+  returns_handler_agent:
+    name: "returns_handler_agent"
+    agent_type: "programmatic"
+    description: "Process returned items in your WMS returns module — restock, scrap or refurbish"
+    communication_type: "chain"
+
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # Returns disposition lives in your WMS returns module, not in
+    # this template. Same gateway as inventory_agent, different
+    # tool. Point this connector at an MCP gateway (or swap
+    # integration to n8n/zapier) that returns the yields below.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${WMS_MCP_URL:}"            # your WMS gateway (Manhattan, Blue Yonder, NetSuite WMS, ...)
+      tool_name: "process_return"       # must return the yields below
+      timeout: 30
+
+    yields:   # ← contract your WMS connector must return
+      return_status: "string"            # restocked | scrapped | refurbish
+      restocked_units: "number"
+
+    inputs:
+      payload: "object"
+
+    can_call:
+      - agent: "inventory_agent"
+        condition: "calling_agent_response.return_status == 'restocked'"
+
+      - agent: "warehouse_audit_logger_agent"
+
+  # ────────────────────────────────────────────────────────────
+  # inventory_control_agent — ONE inventory-control role (2.3.x
+  # ROLE consolidation), mode-dispatched in your WMS:
+  #   · count  — nightly cycle-count sweep
+  #   · ingest — record one physical-count result
+  #   · report — physical-vs-system reconciliation + systematic-
+  #              shrink zone detection
+  # The count ledger and the variance math live in your WMS; the
+  # POLICY lives on the wires below: variance > 2% raises
+  # exception_agent, systematic shrink lands with the warehouse
+  # manager.
+  # ────────────────────────────────────────────────────────────
+  inventory_control_agent:
+    name: "inventory_control_agent"
+    agent_type: "programmatic"
+    description: "Inventory control — nightly cycle counts, count ingest, physical-vs-system reconciliation, shrink-zone detection (store-grounded; deterministic shrink floor)"
+    communication_type: "chain"
+    # wake_up: "0 3 * * *"   # enable after wiring your WMS connector
+
+    # ── DEEP (agency/inventory_control_agent.py) ─────────────────
+    # @pre_compose pulls the SKU master, the body reconciles counts,
+    # and @chain enforce_shrink_floor re-asserts the 2% variance
+    # tolerance + manager-attention floor (agency/_shared/shrink_math).
+    # Day-0 it reconciles the seeded inventory; in PROD swap the body
+    # for the WMS read — point ${WMS_MCP_URL} at your gateway
+    # (tool get_cycle_count_results) returning the yields below.
+
+    yields:   # ← reconciliation contract (also your WMS connector's)
+      mode: "string"                     # count | ingest | report
+      skus_counted: "number"
+      variance_skus: "list"              # [{sku, zone, bin, variance_pct}]
+      max_variance_pct: "number"         # worst single-SKU |physical−system|/system this run
+      total_counts: "number"
+      over_tolerance_count: "number"     # SKUs over the 2% tolerance
+      over_tolerance: "list"             # [{sku, zone, bin, system_qty, physical_qty, variance_units, variance_pct}]
+      systematic_short_zones: "list"     # [{zone, avg_variance_pct, samples}] — avg < −2% across ≥3 counts
+      systematic_short_zone_count: "number"
+      total_variance_units: "number"
+      requires_manager_action: "boolean" # @chain shrink floor verdict
+      recon_briefing: "string"           # 1-2 sentence summary for the manager inbox
+
+    inputs:
+      trigger: "string"
+      mode: "string"
+      sku: "string"
+      zone: "string"
+      bin: "string"
+      system_qty: "number"
+      physical_qty: "number"
+      counter_id: "string"
+
+    can_call:
+      # ── VARIANCE POLICY (moved from the deleted Python module) ──
+      # Cycle-count variance tolerance is 2% (the module's
+      # VARIANCE_TOLERANCE_PCT = 0.02): any SKU above it raises an
+      # exception for floor follow-up.
+      - agent: "exception_agent"
+        condition: "calling_agent_response.max_variance_pct > 0.02"
+
+      # Manager-attention floor (the module's requires_manager_action
+      # = systematic_short_zones > 0 OR over_tolerance > 20): any zone
+      # systematically short (avg variance < −2% across ≥3 counts,
+      # computed by your WMS) OR more than 20 SKUs over the 2%
+      # tolerance.
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.systematic_short_zone_count > 0 or calling_agent_response.over_tolerance_count > 20"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  humanoid_status_agent:
+    name: "humanoid_status_agent"
+    agent_type: "programmatic"
+    description: "Humanoid fleet telemetry — battery / fault / location (store-grounded; fleet-API swap in PROD)"
+    communication_type: "execute"
+
+    # ── DEEP (agency/humanoid_status_agent.py) ───────────────────
+    # Reads the seeded fleet roster day-0; in PROD swap the body for
+    # the fleet-API read — point ${FLEET_API_MCP_URL} at your robot
+    # fleet-management gateway (tool get_fleet_status) returning the
+    # yields below. The fault edge fires off fault_alerts either way.
+
+    yields:   # ← fleet telemetry contract (also your fleet-API connector's)
+      total_units: "number"
+      offline_units: "number"
+      low_battery_units: "number"
+      fault_alerts: "list"               # [{unit_id, fault_code, severity}]
+
+    inputs:
+      payload: "object"
+
+    can_call:
+      - agent: "ops_supervisor_human"
+        condition: "calling_agent_response.fault_alerts != []"
+
+  ops_supervisor_human:
+    name: "ops_supervisor_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Ops supervisor — floor decisions, exceptions, safety"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 1800          # 30 min — exceptions need fast response
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_warehouse_manager"
+      message: "escalate_to_warehouse_manager"
+      note: "Supervisor didn't respond — warehouse manager escalation"
+
+    yields:
+      decision: "string"
+      notes: "string"
+
+    inputs:
+      order_id: "string"
+
+    can_call:
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_warehouse_manager'"
+
+      - agent: "warehouse_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_warehouse_manager'"
+
+  warehouse_manager_human:
+    name: "warehouse_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Warehouse manager — operational tier-2, humanoid governance"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Warehouse manager unavailable — held for review"
+
+    yields:
+      decision: "string"
+      directive: "string"
+
+    inputs:
+      order_id: "string"
+
+    can_call:
+      - agent: "warehouse_audit_logger_agent"
+
+  warehouse_audit_logger_agent:
+    name: "warehouse_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM — every pick, pack, ship, exception, humanoid action"
+    framework: "custom"
+    communication_type: "execute"
+
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/warehouse_audit.jsonl"
+
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+
+    inputs:
+      session_id: "string"
+      payload: "object"
+
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # carrier_selector_agent — picks the optimal carrier per parcel
+  # Real warehouse pain: shipping spend leaks 8-12% without per-parcel
+  # carrier selection (UPS vs FedEx vs USPS vs regional by weight/SLA)
+  # ────────────────────────────────────────────────────────────
+  carrier_selector_agent:
+    name: "carrier_selector_agent"
+    agent_type: "programmatic"
+    description: "Picks the cheapest carrier meeting the SLA (store-grounded rate-shop; deterministic rate-shop floor)"
+    communication_type: "chain"
+
+    # ── DEEP (agency/carrier_selector_agent.py) ──────────────────
+    # @pre_compose pulls the carton weight + rate table, the body
+    # rate-shops, and @chain enforce_rate_shop_floor re-derives
+    # sla_met / cheapest-meeting-SLA (agency/_shared/carrier_math).
+    # Day-0 it rate-shops the seeded table; in PROD swap the body for
+    # the TMS read — point ${TMS_MCP_URL} at your rate API gateway
+    # (tool select_carrier) returning the yields below.
+
+    yields:   # ← rate-shop contract (also your TMS connector's)
+      selected_carrier: "string"        # ups | fedex | usps | dhl | regional
+      service_level: "string"           # ground | 2day | overnight | priority
+      estimated_cost_cents: "number"
+      sla_met: "boolean"
+      savings_vs_default_cents: "number"
+      rationale: "string"
+      tracking_number_placeholder: "string"
+
+    inputs:
+      carton_id: "string"
+      weight_kg: "number"
+      destination: "object"
+      sla_days: "number"
+
+    can_call:
+      - agent: "loader_humanoid"
+
+  # ────────────────────────────────────────────────────────────
+  # replenishment_planner_agent — SKU master + reorder logic (ERP)
+  # ────────────────────────────────────────────────────────────
+  replenishment_planner_agent:
+    name: "replenishment_planner_agent"
+    agent_type: "programmatic"
+    description: "Reads SKU on-hand, reorder points, target qtys from your ERP; surfaces reorder recommendations"
+    communication_type: "chain"
+
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # The SKU master (on-hand, reorder points, target qtys, lead
+    # times, suppliers) lives in your ERP, not in this template.
+    # Point this connector at an MCP gateway (or swap integration to
+    # n8n/zapier) that returns the yields below.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${ERP_MCP_URL:}"            # your ERP gateway (SAP, Oracle, NetSuite, Odoo, ...)
+      tool_name: "get_reorder_recommendations"   # must return the yields below
+      timeout: 30
+
+    yields:   # ← contract your ERP connector must return
+      mode: "string"
+      total_skus: "number"
+      reorder_recommendations: "list"    # [{sku, qty_on_hand, reorder_point, order_qty_recommended, supplier_id, lead_time_days, urgency}]
+      critical_stockout_count: "number"  # SKUs at zero on-hand
+      replenishment_briefing: "string"
+
+    inputs:
+      mode: "string"
+      sku: "string"
+      description: "string"
+      qty_on_hand: "number"
+      reorder_point: "number"
+      target_qty: "number"
+      lead_time_days: "number"
+      supplier_id: "string"
+      delta: "number"
+
+    can_call:
+      # Critical-stockout floor (the module's requires_supervisor_action
+      # = critical_count > 0): any SKU at zero on-hand goes straight to
+      # the ops supervisor.
+      - agent: "ops_supervisor_human"
+        condition: "calling_agent_response.critical_stockout_count > 0"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # supplier_relations_agent — ONE supplier relationship manager
+  # (2.3.x ROLE consolidation: onboarding + sourcing + quarterly
+  # scorecards — three responsibilities of one hire).
+  #
+  # DEEP (agency/supplier_relations_agent.py): @pre_compose
+  # load_supplier_context pulls the supplier's scorecard + trailing
+  # performance HISTORY (and, per mode, the category candidate pool /
+  # the precomputed signal rows across all suppliers) from the source
+  # store BEFORE the LLM reasons — so it grades over real on-time %,
+  # defect-PPM trend and ESG/KYC state, not a spoon-fed blob the caller
+  # pasted in. Scorecard MATH (on-time %, defect PPM, composite scores)
+  # is still computed upstream in your ERP/WMS; the agent grades + flags
+  # the TREND. The onboarding/sourcing gates are hard rules in the
+  # prompt, with the definitive floors (ESG high / KYC rejected /
+  # procurement-lead) duplicated on the wires below.
+  # ────────────────────────────────────────────────────────────
+  supplier_relations_agent:
+    name: "supplier_relations_agent"
+    agent_type: "llm"
+    description: "Supplier relationship manager — onboarding gates, alternate sourcing, quarterly scorecards"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 2000
+    communication_type: "chain"
+    wake_up: "0 9 1 1,4,7,10 *"        # Quarterly first-of-month 09:00 — scorecard responsibility (single cron)
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"mode": "", "supplier_id": "", "legal_name": "", "category": "", "status": "", "rejection_reason": "", "steps_complete": [], "steps_remaining": [], "esg_risk": "", "kyc_status": "", "banking_verified": false, "insurance_required": false, "insurance_provided": false, "requires_procurement_lead_approval": false, "requires_compliance_review": false, "updated_at_utc": "", "run_id": "", "sku": "", "reason": "", "preferred_count": 0, "market_count": 0, "shortlist": [], "shortlist_size": 0, "requires_rfq": false, "requires_procurement_lead": false, "no_qualified_alternates": false, "generated_at_utc": "", "period": "", "scorecards": [], "scorecard_count": 0, "suppliers_requiring_action": [], "action_count": 0, "requires_procurement_lead_review": false}
+      You are the supplier relationship manager for this warehouse.
+      One role, three responsibilities. An explicit "mode" in the
+      input always wins; otherwise infer it from the payload shape
+      (supplier_signals/period → scorecard; sku/category → sourcing;
+      supplier_id → onboarding; an empty scheduled tick → scorecard
+      with neutral values). Return ONE JSON object. Use empty /
+      neutral values for the responsibilities that don't apply, and
+      keep ALL routing flags false for inactive responsibilities —
+      fail-closed.
+
+      RESPONSIBILITY 1 — ONBOARDING (mode: onboarding).
+      Update / verify the supplier's onboarding state. Fill
+      "supplier_id", "legal_name", "category", "kyc_status"
+      (pending | approved | rejected), "banking_verified",
+      "insurance_required", "insurance_provided", "esg_risk"
+      (low | medium | high), "steps_complete" / "steps_remaining"
+      (steps: kyc, tax_forms, banking, insurance, esg_screening,
+      systems_integration), "status", "rejection_reason",
+      "updated_at_utc".
+      Hard rules (non-negotiable policy — the wires enforce the floors):
+        - Never mark a step complete unless the evidence is in the
+          input. Pending is the default.
+        - No supplier_id in the input → "status" = "in_progress",
+          "rejection_reason" = "no_supplier_id", every routing flag
+          false. A skip is not a decision.
+        - "kyc_status" = "rejected" → "status" = "rejected",
+          "rejection_reason" = "kyc_rejected",
+          "requires_compliance_review" = true.
+        - "esg_risk" = "high" → "status" = "rejected",
+          "rejection_reason" = "esg_high_risk",
+          "requires_compliance_review" = true.
+        - Insurance is required when category is construction,
+          logistics, professional_services or technology — set
+          "insurance_required" accordingly.
+        - "status" = "approved" ONLY when ALL gates pass: kyc
+          complete with kyc_status approved; tax_forms complete;
+          banking complete with banking_verified true; esg_screening
+          complete with esg_risk not high; insurance provided
+          whenever required; systems_integration complete.
+        - "requires_procurement_lead_approval" = true ONLY when
+          status is approved (final human sign-off).
+
+      RESPONSIBILITY 2 — SOURCING (mode: sourcing).
+      Find qualified alternate suppliers for the SKU. Candidates come
+      from the preferred-supplier list in your knowledge base and any
+      market data in the input — each record carries supplier_id (or
+      name + country for market candidates), categories, esg_risk,
+      lead_time_days, recent_on_time_pct. Fill "run_id", "sku",
+      "reason", "preferred_count", "market_count", "shortlist",
+      "shortlist_size", "requires_rfq", "generated_at_utc".
+      Hard rules:
+        - Missing sku or category → "reason" = "missing_keys" and
+          "no_qualified_alternates" = false. A skip is NOT "no
+          qualified alternates" — never fire that flag on missing
+          inputs.
+        - Only candidates whose categories include the requested one
+          qualify, and only those whose esg_risk meets the requested
+          esg_floor (floor low → only low; floor medium → low or
+          medium; default floor is medium).
+        - Rank by lead time and recent reliability; preferred-list
+          candidates always beat market candidates in the
+          "shortlist" (max 3).
+        - "requires_rfq" = true when no preferred candidate qualifies
+          but market candidates do.
+        - "requires_procurement_lead" = true when the shortlist is
+          non-empty; "no_qualified_alternates" = true ONLY when sku
+          and category were given and the shortlist is empty.
+        - Don't invent on-time percentages — leave 0 if unknown.
+
+      RESPONSIBILITY 3 — QUARTERLY SCORECARDS (mode: scorecard).
+      The scorecard MATH is computed upstream in your ERP/WMS: each
+      record in supplier_signals arrives with on_time_pct,
+      defect_ppm, response_hours_median, pricing_trend_pct,
+      esg_compliance and (when provided) composite_score. NEVER
+      recompute or invent scores — reason over what arrived. Fill
+      "period", "scorecards" (pass records through, adding grade and
+      requires_action per the policy below), "scorecard_count",
+      "suppliers_requiring_action", "action_count",
+      "generated_at_utc".
+      Hard rules:
+        - Grade bands on composite_score: A ≥ 0.85, B ≥ 0.70,
+          C ≥ 0.55, D < 0.55.
+        - requires_action when: on_time_pct < 0.85, OR defect_ppm >
+          1000, OR response_hours_median > 24, OR esg_compliance not
+          current, OR grade D.
+        - "requires_procurement_lead_review" = true when ANY supplier
+          requires action.
+        - No supplier_signals (e.g. the bare quarterly tick) →
+          neutral empties, all flags false.
+
+    narration: >
+      If a scorecard narrative reveals a quality slide on goods
+      currently moving through this warehouse (rising defect PPM on
+      active SKUs), consider exception_agent so the floor starts
+      inspecting inbound lots before the quarterly review lands.
+
+    enforce_yields: true
+
+    # knowledge: kept preferred_supplier_list (sourcing is the
+    # retrieval-heavy responsibility — the preferred list IS the KB);
+    # merge the supplier_categories rows into it. The scorecard
+    # responsibility had no knowledge group.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "preferred_supplier_list"
+
+    yields:
+      mode: "string"
+      # onboarding responsibility
+      supplier_id: "string"
+      legal_name: "string"
+      category: "string"
+      status: "string"
+      rejection_reason: "string"
+      steps_complete: "list"
+      steps_remaining: "list"
+      esg_risk: "string"
+      kyc_status: "string"
+      banking_verified: "boolean"
+      insurance_required: "boolean"
+      insurance_provided: "boolean"
+      requires_procurement_lead_approval: "boolean"
+      requires_compliance_review: "boolean"
+      updated_at_utc: "string"
+      # sourcing responsibility
+      run_id: "string"
+      sku: "string"
+      reason: "string"
+      preferred_count: "number"
+      market_count: "number"
+      shortlist: "list"
+      shortlist_size: "number"
+      requires_rfq: "boolean"
+      requires_procurement_lead: "boolean"
+      no_qualified_alternates: "boolean"
+      generated_at_utc: "string"
+      # scorecard responsibility
+      period: "string"
+      scorecards: "list"
+      scorecard_count: "number"
+      suppliers_requiring_action: "list"
+      action_count: "number"
+      requires_procurement_lead_review: "boolean"
+
+    inputs:
+      upstream_yields: "object"
+      mode: "string"
+      supplier_id: "string"
+      sku: "string"
+      category: "string"
+      reason: "string"
+      esg_floor: "string"
+      supplier_signals: "list"
+      period: "string"
+
+    can_call:
+      # onboarding guardrails — flags default false in other modes
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.requires_procurement_lead_approval == true"
+
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.requires_compliance_review == true"
+
+      # Definitive onboarding gate floors — fire even if the model
+      # forgets to set requires_compliance_review (esg_risk / kyc_status
+      # stay neutral "" outside onboarding mode, so these never
+      # misfire elsewhere).
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.esg_risk == 'high'"
+
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.kyc_status == 'rejected'"
+
+      # sourcing guardrails
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.requires_procurement_lead == true"
+
+      - agent: "exception_agent"
+        condition: "calling_agent_response.no_qualified_alternates == true"
+
+      # scorecard guardrail
+      - agent: "warehouse_manager_human"
+        condition: "calling_agent_response.requires_procurement_lead_review == true"
+
+    auto_store_response: true
+    auto_store_yields: true

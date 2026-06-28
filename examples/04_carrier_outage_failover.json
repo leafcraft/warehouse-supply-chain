@@ -1,0 +1,28 @@
+{
+  "_entry_point": "carrier_outage_failover",
+  "_description": "Primary carrier outage \u2014 failover to next-cheapest meeting SLA.",
+  "payload": {
+    "outage_id": "carrier-out-2026-0604",
+    "primary_carrier": "FastShip",
+    "outage_start_utc": "2026-06-04T13:00:00Z",
+    "outage_duration_estimate_hr": 6,
+    "affected_orders_count": 47,
+    "carton_mix": [
+      {
+        "weight_kg": 0.5,
+        "destination_zone": "Z3",
+        "count": 22
+      },
+      {
+        "weight_kg": 2.5,
+        "destination_zone": "Z6",
+        "count": 18
+      },
+      {
+        "weight_kg": 8.0,
+        "destination_zone": "Z8",
+        "count": 7
+      }
+    ]
+  }
+}
