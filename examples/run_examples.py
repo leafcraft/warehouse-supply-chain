@@ -17,8 +17,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Register the audit connector before SDK start
-import agency._shared.audit_logger  # noqa: F401
+# Register the @global_tool dev-store tools BEFORE from_yaml/start
+import agency.tools  # noqa: F401
+from agency._shared import audit_logger as _audit_logger
 
 from leafmesh import LeafMesh, LeafMeshLogger
 
@@ -66,6 +67,9 @@ async def main() -> int:
         return 1
 
     sdk = LeafMesh.from_yaml("configs/config.yaml")
+    # WORM audit sink — custom external agents attach via mesh.intelligence (2.4+),
+    # after from_yaml and before start.
+    _audit_logger.register(sdk, "warehouse_audit_logger_agent")
     await sdk.start()
     try:
         for scenario_path in scenarios:

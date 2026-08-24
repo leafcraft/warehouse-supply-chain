@@ -9,11 +9,13 @@ python examples/run_examples.py                 # all scenarios
 python examples/run_examples.py 01_             # one scenario (substring match)
 ```
 
-This template is YAML-first: inventory, returns, carrier selection,
-replenishment and fleet telemetry are connectors into YOUR systems.
-Set `WMS_MCP_URL` / `TMS_MCP_URL` / `ERP_MCP_URL` / `FLEET_API_MCP_URL`
-in `.env` first — scenarios that touch an unwired connector return an
-empty contract instead of live data.
+This pod runs **day-0 with no connectors**: inventory, returns, carrier
+selection, replenishment, cycle-count and fleet telemetry are
+store-grounded against the seeded dev store (`agency/_shared/store.py`)
+and each announces `available: false` when there is no real source. To
+run against YOUR systems, set `WMS_MCP_URL` / `TMS_MCP_URL` /
+`ERP_MCP_URL` / `FLEET_API_MCP_URL` in `.env` and uncomment the matching
+`mcp` block in `configs/config.yaml`.
 
 ## Scenario map
 

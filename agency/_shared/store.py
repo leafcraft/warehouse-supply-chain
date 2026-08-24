@@ -326,6 +326,51 @@ def get_shipment(carton_id: str) -> dict[str, Any]:
     return dict(_load("shipments").get(str(carton_id or ""), {}))
 
 
+# ── Outbox (the dispatcher's sends) + append-only ledger ─────────────
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    """Record an outbound action (dev mirror of the carrier/dock dispatch)."""
+    with _LOCK:
+        outbox = _load("outbox")
+        rows = outbox.get("rows") or []
+        rec = {"recorded_at": _now(), **entry}
+        rows.append(rec)
+        _save("outbox", {"rows": rows})
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only fulfilment ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        ledger = _load("fulfillment_ledger")
+        rows = ledger.get("rows") or []
+        rec = {"recorded_at": _now(), **entry}
+        rows.append(rec)
+        _save("fulfillment_ledger", {"rows": rows})
+    return rec
+
+
+# ── Atomic claim for the cycle-count instance fan-out ────────────────
+def claim_count_batch(session_id: str, batch_size: int = 1) -> list[dict[str, Any]]:
+    """Atomically pop up to batch_size SKUs from a per-session cycle-count
+    backlog, so parallel `instances` of inventory_control split the work instead
+    of duplicating it. The backlog is seeded once from the SKU master; each copy
+    calls this and receives a DISJOINT batch. PROD: an atomic WMS queue pop
+    (LPOP N / UPDATE ... SKIP LOCKED RETURNING)."""
+    sid = str(session_id or "_nosession")
+    with _LOCK:
+        state = _load("count_backlog")
+        buckets = state.get("buckets") or {}
+        if sid not in buckets:
+            buckets[sid] = [rec.get("sku") for rec in all_skus()]
+        pending = buckets.get(sid) or []
+        claimed_skus = pending[:max(1, int(batch_size))]
+        buckets[sid] = pending[len(claimed_skus):]
+        state["buckets"] = buckets
+        _save("count_backlog", state)
+    inv = _inventory()
+    return [dict(inv.get(s, {"sku": s})) for s in claimed_skus]
+
+
 # ── Suppliers (ERP / SRM) ────────────────────────────────────────────
 def get_supplier(supplier_id: str) -> dict[str, Any]:
     """One supplier's master + current scorecard + history. PROD: SRM read."""

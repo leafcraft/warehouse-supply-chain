@@ -1,224 +1,131 @@
-# warehouse-supply-chain — Warehouse / Supply Chain (with humanoid integration)
+# warehouse-supply-chain — Warehouse / Supply-Chain Fulfilment Pod
 
-Realises the **supply × goods** ROI cell, and introduces the FOURTH
-actor kind — **humanoids** ($3-8/hr projected) doing the physical share
-of the work alongside the agents that reason about it.
+A coordinator + specialists + humanoid actors + a finisher + two human roles that
+run an outbound order end to end — **order → allocate + travel-minimised route →
+reserve → pick (humanoid) → inspect → pack → rate-shop carrier → DISPATCH
+(release gate + manifest) → load → ship** — with the standing supply-chain roles
+running alongside (cycle-count / shrink control, returns, replenishment, supplier
+relations, humanoid-fleet telemetry). Systems of record (WMS / TMS / ERP / fleet
+API) are **tools inside the agents** — commented `mcp` blocks + dev-store
+fallbacks that announce themselves — never members.
 
-## Story
-
-It's 14:07 on a Tuesday. **Maria**, a customer in Denver, places order
-`ORD-4471` for two SKUs through the storefront; the OMS fires its
-webhook into the mesh at `order_placed`. `allocation_agent` (warehouse
-domain math) builds the pick plan, batches it, tags it `standard`
-priority, bin-sorts the two lines into a travel-minimised pick sequence,
-estimates three minutes, and assigns `picker_humanoid` — while
-`inventory_agent` reserves the units in the WMS in parallel. The
-humanoid picker walks the route, picks clean, and hands off to
-`packer_humanoid`, which boxes carton `CTN-…` and calls
-`loader_humanoid`. Loading writes the WORM audit line and the order is
-on the dock. Maria's parcel ships that afternoon, untouched by a human.
-
-Now order `ORD-4472`: the picker reports a crushed corner —
-`damage_flag` true. The mesh forks: `inspection_humanoid` verifies the
-item is not safe to ship, and `exception_agent` classifies it. Severity
-lands at 0.8, so the wire condition (`severity >= 0.7`) routes it
-straight to **Dwayne**, the on-shift **ops supervisor**, with a
-2-sentence floor briefing on his tablet — and the manager's narration
-hints that, since this lot came from inbound supplier goods, the
-supplier relationship manager should start inspecting that supplier's
-inbound lots. Dwayne reads it in 90 seconds, approves a substitution,
-and the trail is hash-chained into the WORM audit. Nobody watched a
-dashboard; the routine ran itself and the one judgment call reached the
-right human fast.
-
-## Depth — self-reliant agents, deterministic floors
-
-This is not a thin YAML wrapper. The agents pull their own context and
-enforce their own floors:
-
-- **Self-reliant context (`@pre_compose`)** — `allocation_agent` pulls the
-  order, bin/slotting locations and free-stock availability;
-  `picker_humanoid` reserves a ready fleet unit; `inventory_control_agent`
-  pulls the SKU master; `carrier_selector_agent` pulls the carton weight +
-  rate table. All from the seeded dev store (`agency/_shared/store.py`) day-0,
-  the live system in prod.
-- **Deterministic floors (`@chain`) the LLM can't waive** — the
-  **availability gate** (a short order can't dispatch a picker), the
-  **shrink / cycle-count threshold** (2% variance + systematic-shrink
-  manager floor), the **carrier rate-shop rule** (cheapest-meeting-SLA,
-  `sla_met` re-derived), and **ship-readiness** (no empty/weightless carton
-  ships). Plus the exception severity/safety floor on the wires.
-- **Real actuators + idempotency** — the humanoid task-dispatch side
-  effects run once per `(session, task)` via `agency/_shared/session_stash.py`;
-  a re-entered chain never double-dispatches a pick.
-- **Day-0, no connectors** — the seeded store carries a realistic order
-  (`ORD-4471`), inventory with one short SKU (`SKU-7700`, to exercise the
-  gate + damage/exception path), a 5-unit humanoid fleet (one on low
-  battery) and a carrier rate table, so the FULL chain runs out of the box.
+**Read `PRD.md`** for the full agent-by-agent spec. This is a **pod-standard
+reference** (SDK 2.4.131): a team of self-reliant agents, not a pipeline.
 
 ## Why it works in an organization
 
-Replenishment, picking, packing, cycle-counting and carrier selection
-are ~75% routine and historically run on people **watching dashboards**
-and reacting. This agency absorbs the routine and *acts*: agents pull
-on-hand counts, reserve stock, sequence pick routes, rate-shop carriers,
-sweep cycle counts and score suppliers — and the humanoids do the
-physical pick / inspect / pack / load. The ROI is direct: COGS and
-labour are the dominant cost line in goods, per-parcel carrier selection
-typically recovers 8-12% of shipping spend that leaks without it, and
-cycle-count + shrink-zone detection catches inventory loss before it
-compounds. Humans are pulled in **only** at genuine judgment or
-irreversible points (damage/safety exceptions, ESG/KYC supplier gates,
-critical stockouts) — default-deny on timeout — so supervisory headcount
-scales with exceptions, not with volume. Every pick, pack, ship,
-exception and humanoid action lands in a hash-chained WORM audit, which
-is what makes the autonomy defensible.
+Warehouse replenishment and fulfilment run on people watching dashboards —
+someone allocates a pick, someone rekeys a count, someone rate-shops a carton by
+hand, someone chases a damaged return. That routine is ~75% of the work and it
+leaks money: shipping spend drifts 8–12% without per-parcel carrier selection,
+and shrink hides in cycle-count variance nobody sweeps. This pod absorbs the
+routine and **acts**, alongside the people who still own the calls. It wins the
+honest way: **allocation's availability gate** never dispatches a picker for
+stock that isn't free; **the exception handler** can't down-rate a safety,
+damage, or high-value event — the deterministic floor re-asserts escalation from
+the WMS unit value, not the model's guess; **the shipment dispatcher re-checks a
+real release token** before it issues a manifest and **deletes a half-issued
+shipment** if its floor trips; **cycle-count fans out across zones** with each
+copy claiming a disjoint batch, and the shrink floor re-asserts the 2% tolerance.
+**Silence never advances an order** — every human gate default-denies to
+`held_for_review` and lands in the audit sink. Every pick, pack, ship, exception,
+humanoid action, and held gate is hash-chained in a WORM ledger. Humanoids
+(projected $3–8/hr) do the physical share; the agents do the judgment and the
+paperwork.
 
-## Configuration (three tiers)
+## The team (18 members)
 
-### Tier 1 — Boot (required to start)
-
-| Var | Required | Purpose |
-|---|---|---|
-| `LEAFMESH_LICENSE_KEY` | yes | SDK license |
-| `OPENAI_API_KEY` | yes | the two `llm` agents (`gpt-4o-mini`) + manager |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | host-provided | session store / auto-storage |
-| `LEAFMESH_ENV_TOKEN` | yes | environment token (`development`) |
-| `ANTHROPIC_API_KEY` | optional | only if you switch a model to Claude |
-
-### Tier 2 — Host prereqs + system-of-record adapters
-
-**The mesh runs end-to-end day-0 with NONE of these set** — the deepened
-agents read the seeded dev store (`agency/_shared/store.py`). Set a URL
-only when you swap that agent for the live system of record.
-
-Pure MCP connectors (`integration: mcp` + `connector_config`; `yields:` is
-the contract your gateway must return; unset → empty contract until wired):
-
-| Env var | System of record | Agents (tool_name) |
-|---|---|---|
-| `WMS_MCP_URL` | WMS (Manhattan, Blue Yonder, NetSuite WMS, …) | `inventory_agent` (check_and_reserve_stock), `returns_handler_agent` (process_return) |
-| `ERP_MCP_URL` | ERP (SAP, Oracle, NetSuite, Odoo, …) | `replenishment_planner_agent` (get_reorder_recommendations) |
-
-Store-grounded deepened agents (read the seeded store until you swap the
-module body for the live read — the PROD swap targets):
-
-| Env var | System of record | Agent | PROD swap |
+| Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `WMS_MCP_URL` | WMS count ledger | `inventory_control_agent` | `get_cycle_count_results` |
-| `TMS_MCP_URL` | TMS / rate API (Shippo, EasyPost, …) | `carrier_selector_agent` | `select_carrier` |
-| `FLEET_API_MCP_URL` | robot fleet API | `humanoid_status_agent` | `get_fleet_status` |
+| `fulfillment_coordinator_agent` | Fulfilment Coordinator | Owns the order end to end; opens it, keeps live status, is the single contact | LLM; orchestrates allocation→…→dispatch; **listen_events** on OMS order stream; escalates to the Warehouse Manager; **never allocates, picks, or releases** |
+| `allocation_agent` | Slotting & Pick Planner | Pick path, batching, priority + travel-minimised route in one step | Programmatic; `@pre_compose` pulls order+bins; `@chain` **availability gate** (no dispatch on short stock) |
+| `inventory_agent` | Stock Controller | Confirms stock + reserves units; absorbs inbound restock | Programmatic; store-grounded day-0; shortage → exception; commented WMS `mcp` |
+| `exception_agent` | Exceptions Analyst | Classifies short-pick / damage / wrong-item / safety and briefs the floor | LLM + **playbook**; `@pre_compose` pulls order+value+unit; `@chain` **severity/safety floor** (fail closed) |
+| `picker_humanoid` | Picker (Humanoid) | Physical pick from bins | Programmatic actuator; reserves a ready fleet unit; idempotent dispatch |
+| `inspection_humanoid` | QA Inspector (Humanoid) | Verifies condition of flagged items | Programmatic actuator |
+| `packer_humanoid` | Packer (Humanoid) | Packs picked units into a carton | Programmatic actuator; `@chain` **ship-readiness floor** |
+| `carrier_selector_agent` | Transportation Analyst | Picks the cheapest carrier meeting the SLA | Programmatic; `@chain` **rate-shop floor**; commented TMS `mcp` |
+| `shipment_dispatcher_agent` | Dispatch / Shipping Lead | Re-checks the release, renders the shipping manifest, hands to load | Programmatic **finisher**; release-token re-check → invariants → render manifest → **delete-on-block** → WORM ledger |
+| `loader_humanoid` | Dock Loader (Humanoid) | Loads a released carton onto the outbound truck | Programmatic actuator |
+| `returns_handler_agent` | Returns Clerk | Dispositions a return — restock / refurbish / scrap | Programmatic; store-grounded day-0; commented WMS `mcp` |
+| `inventory_control_agent` | Cycle-Count Controller | Cycle counts, ingest, physical-vs-system reconciliation, shrink-zone detection | Programmatic; **instances** fan-out (atomic claim per zone) + **wake_up**/**timezone**; `@chain` **shrink floor** |
+| `replenishment_planner_agent` | Replenishment Planner | Reorder recommendations off the SKU master; critical-stockout flag | Programmatic; store-grounded day-0; commented ERP `mcp` |
+| `supplier_relations_agent` | Supplier Relationship Manager | Onboarding gates, alternate sourcing, quarterly scorecards | LLM + **super_agent** + **playbook** + dev-store lookup tools; `@pre_compose` pulls scorecards+history; **wake_up**/**timezone** |
+| `humanoid_status_agent` | Fleet Telemetry | Humanoid battery / fault / location telemetry | Programmatic; fault → Ops Supervisor |
+| `ops_supervisor_human` | Ops Supervisor (Human) | Floor decisions, exceptions, safety, humanoid faults | Human gate (webhook); 30-min timeout |
+| `warehouse_manager_human` | Warehouse Manager (Human) | Accountable owner: dispatch release, tier-2 governance, supplier gates, shrink | Human gate (webhook); everything that leaves the pod |
+| `warehouse_audit_logger_agent` | WORM audit | Hash-chains every pick, pack, ship, exception, humanoid action, and held gate | External (custom sink); terminus |
 
-Redis (`docker run -d -p 6379:6379 redis:7-alpine`) is the only hard
-host prereq.
+The **LeafMesh Manager** supervises — it reads every hand-off and escalates
+stalls / safety-damage-high-value exceptions / release timeouts / systematic
+shrink to the Warehouse Manager automatically. Human gates never call each other
+(a `dual`→`dual` edge auto-bounces); escalation goes through the Manager.
 
-### Tier 3 — Connectors / escalation targets (optional)
+## Configuration — what to set, in three tiers
 
-| Env var | Used by | Notes |
+Everything is set in `.env` (`cp env .env`). The **whole chain runs on Tier 1
+alone** against the seed store (`./data`): stock reads/reserves, cycle counts,
+carrier rates, supplier scorecards, and the humanoid fleet are dev stand-ins that
+**announce themselves** (`available: false`) until you wire Tiers 2–3.
+
+### Tier 1 — required to boot (dev mode)
+| Setting | For | Notes |
 |---|---|---|
-| `PAGER_WEBHOOK` | manager escalation `webhook` target | PagerDuty Events v2 default |
-| `SLACK_WAREHOUSE_CHANNEL` | manager escalation `channel` target | the target's `channel_id` (the `[warehouse]` alert) |
-| `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` | — | fields of a `channels: {slack: {...}}` block (`ChannelConfig`). This template has **no `channels:` block**, so they are **not auto-consumed** — the escalation `channel` target only reads `channel_id`. Add a `channels:` block to use them. |
+| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `OPENAI_API_KEY` | Coordinator + exception + supplier + Manager (`gpt-4o-mini`) | **Required** unless you change the models. |
+| `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
+| `HITL_OUTBOUND_URL` | Where human members are notified | Defaults to a local stub. |
 
-## Agent table
+### Tier 2 — real systems of record (set the URL, uncomment the `mcp` block)
+| Setting | Enables |
+|---|---|
+| `WMS_MCP_URL` / `_TOKEN` | Real stock / reservations, returns, cycle-count reads |
+| `TMS_MCP_URL` / `_TOKEN` | Real carrier rate tables |
+| `ERP_MCP_URL` / `_TOKEN` | Real SKU master + supplier scorecards |
+| `FLEET_API_MCP_URL` | Real humanoid fleet telemetry + dispatch |
+| `ORDER_EVENTS_REDIS_URL` | The Redis stream the OMS writes `orders.created` to |
 
-Role = the human job title each agent stands in for.
+> ⚠️ The SDK rejects an `mcp` block with an **empty** URL at load, so every
+> connector block ships **commented** in `configs/config.yaml`. Fill the URL,
+> then uncomment. Until then the dev-store body answers and announces itself.
 
-| Agent | Role | Responsibilities | Can perform |
-|---|---|---|---|
-| `allocation_agent` | Warehouse allocation & routing planner | Pull order/bins/availability (`@pre_compose`), build pick plan, batch, set priority, bin-sort the travel-min route, assign the picking resource; enforce the availability gate (`@chain`); passthrough `order_id` | programmatic + domain math; calls `inventory_agent` (reserve), `exception_agent` (short order), `picker_humanoid` (available pick) or `warehouse_manager_human` (hazmat → human picker) |
-| `inventory_agent` | Inventory clerk (WMS) | Confirm stock and reserve units in the WMS | MCP connector; calls `exception_agent` on shortage |
-| `exception_agent` | Floor exceptions analyst | Classify short-pick / damage / wrong-item / safety, set severity, recommend action, write the supervisor briefing | LLM; wire floors → `ops_supervisor_human` (safety / severity≥0.7) else `warehouse_audit_logger_agent`; narration → manager / supplier-relations |
-| `picker_humanoid` | Picker (humanoid) | Reserve a ready fleet unit (`@pre_compose`), dispatch the physical pick (idempotent actuator); report status / units / damage | programmatic actor; calls `inspection_humanoid` (damage), `exception_agent` (not clean), `packer_humanoid` (clean) |
-| `inspection_humanoid` | Quality inspector (humanoid) | Verify condition of flagged items; set safe-to-ship | programmatic actor; calls `packer_humanoid` (pass) or `exception_agent` (fail) |
-| `packer_humanoid` | Packer (humanoid) | Pack picked items into a carton; enforce ship-readiness (`@chain`); record the shipment | programmatic actor; calls `loader_humanoid` |
-| `loader_humanoid` | Dock loader (humanoid) | Load cartons onto outbound trucks; stamp the shipment loaded | programmatic actor; calls `warehouse_audit_logger_agent` |
-| `returns_handler_agent` | Returns processor (WMS) | Disposition returns — restock / scrap / refurbish | MCP connector; calls `inventory_agent` (restock), `warehouse_audit_logger_agent` |
-| `inventory_control_agent` | Cycle-count & shrink controller | Pull the SKU master (`@pre_compose`), reconcile counts, enforce the 2% shrink threshold + manager floor (`@chain`) | programmatic + shrink math (WMS swap); wire floors → `exception_agent` (variance>2%), `warehouse_manager_human` (systematic shrink / >20 over tolerance) |
-| `carrier_selector_agent` | Transportation / rate-shopping planner | Pull weight + rate table (`@pre_compose`), rate-shop cheapest-meeting-SLA, re-derive `sla_met` (`@chain`); quarterly re-cost; outage failover | programmatic + carrier math (TMS swap); calls `loader_humanoid` |
-| `replenishment_planner_agent` | Replenishment / demand planner | Read SKU on-hand, reorder points, target qtys from ERP; surface reorder recommendations | MCP connector (ERP); wire floor → `ops_supervisor_human` (critical stockout) |
-| `supplier_relations_agent` | Supplier relationship manager | Onboarding gates (KYC/ESG/banking/insurance), alternate sourcing, quarterly scorecards | LLM + quarterly cron; floors → `warehouse_manager_human` (approval / compliance / ESG-high / KYC-rejected / lead review), `exception_agent` (no alternates) |
-| `humanoid_status_agent` | Robotics fleet operations monitor | Ingest fleet telemetry — battery / fault / location (store-grounded; fleet-API swap) | programmatic; calls `ops_supervisor_human` on fault alerts |
-| `ops_supervisor_human` | Operations supervisor (HITL) | Floor decisions, exceptions, safety sign-off (30-min timeout) | human; escalates to `warehouse_manager_human` or `warehouse_audit_logger_agent` |
-| `warehouse_manager_human` | Warehouse manager (HITL) | Operational tier-2, humanoid governance, supplier sign-off (4-hr timeout, default-deny halt) | human; calls `warehouse_audit_logger_agent` |
-| `warehouse_audit_logger_agent` | Compliance / audit recorder | Hash-chained WORM record of every pick, pack, ship, exception, humanoid action | external `custom` (registered in `main.py`); terminal |
+### Tier 3 — replace the dev store with your durable system of record
+Swap the function bodies in `agency/_shared/store.py` for your WMS/ERP/TMS calls
+(or point the `mcp` blocks at a gateway). The signatures are the contract — the
+mesh does not change.
 
-## Trust mechanisms
-
-Deterministic floors (`@chain` in Python — the LLM/body can't waive them):
-
-- **Availability gate** — a short order line is never dispatched to a picker; it surfaces as a short-pick exception (`allocation_math`)
-- **Shrink / cycle-count threshold** — any SKU over 2% variance, or a systematic-short zone, escalates (`shrink_math`)
-- **Carrier rate-shop rule** — cheapest carrier meeting the SLA; `sla_met` re-derived from transit days (`carrier_math`)
-- **Ship-readiness** — no empty/weightless carton is marked packed (`allocation_math`)
-- **Idempotency** — humanoid actuators dispatch once per `(session, task)` (`session_stash`)
-
-Policy on the wires:
-
-- **Safety event** → supervisor, always (prompt hard rule + wire condition on `exception_type == 'safety'`)
-- **Severity ≥ 0.7** → supervisor required (wire condition)
-- **Cycle-count variance > 2%** on any SKU → `exception_agent`
-- **Systematic shrink** (any zone avg < −2% across ≥3 counts, or >20 SKUs over tolerance) → warehouse manager
-- **Critical stockout** (any SKU at zero on-hand) → ops supervisor
-- **ESG high / KYC rejected** supplier → warehouse manager, even if the model forgets the compliance flag
-- **Inspection humanoid** verifies any flagged item before pack
-- **HITL chain** with default-deny on warehouse-manager timeout
-- **Hash-chained WORM audit** on every pick / pack / ship / exception / humanoid action
-
-## Crons
-
-- `supplier_relations_agent` — quarterly scorecard tick (`0 9 1 1,4,7,10 *`)
-- `inventory_control_agent` — nightly count sweep ships commented out;
-  enable `# wake_up: "0 3 * * *"` after wiring your WMS connector
-
-## Entry points
-
-`order_placed`, `return_received`, `restock_event`,
-`cycle_count_scheduled`, `humanoid_status`, `manual_action`,
-`sku_master_update`, `reorder_sweep`, `cycle_count_ingest`,
-`inventory_recon`, `carrier_select`, `bulk_rate_renegotiation`,
-`carrier_outage_failover`, the supplier-relations entries
-(`supplier_relations_onboarding` / `_sourcing` / `_quarterly_scorecard`),
-plus per-agent `direct_call_*` entries for programmatic / debug ingest.
-
-## Quick start
+## Run it
 
 ```bash
-cp env .env && pip install -r requirements.txt
+pip install -r requirements.txt          # core LeafMesh + apscheduler runs the pod day-0
 docker run -d -p 6379:6379 redis:7-alpine
-python main.py
+cp env .env                              # fill at least Tier 1
+python validate_config.py                # pre-flight: wiring, yields, dead-code
+python main.py                           # API at http://127.0.0.1:18820/docs
 ```
 
-### Day-0 entry call (runs against the seeded store, no connectors)
+Place an order (day-0, against the seed store — no connector needed):
 
-```python
-import asyncio
-from leafmesh import LeafMesh
-from agency._shared import audit_logger
-
-async def main():
-    mesh = LeafMesh.from_yaml("configs/config.yaml")
-    audit_logger.register(mesh, "warehouse_audit_logger_agent")
-    await mesh.start()
-
-    # Clean order — allocation gate passes, humanoid picks → packs → ships
-    result = await mesh.mesh_call("order_placed", {"order": {
-        "order_id": "ORD-4471", "ship_method": "standard",
-        "line_items": [{"sku": "SKU-9001", "quantity": 1},
-                       {"sku": "SKU-7700", "quantity": 1}]}},
-        session_id="demo-1")
-    print(result)   # all_available=True, pick_sequence bin-sorted, dispatched
-
-    await mesh.stop()
-
-asyncio.run(main())
+```bash
+curl -X POST http://127.0.0.1:18820/api/mesh/request \
+  -H "Content-Type: application/json" \
+  -d '{"entry_point":"order_placed",
+       "data":{"order":{"order_id":"ORD-4471"}}}'
 ```
 
-Or run the bundled scenarios: `python examples/run_examples.py` (01 =
-clean order, 02 = the availability-gate short path, 03 = returns
-inspection, 04 = carrier failover).
+`ORD-4490` over-demands a short SKU on purpose — watch the availability gate
+raise a short-pick exception instead of dispatching a picker. On release, the
+dispatcher renders the shipping manifest to `./out/` and appends
+`./data/fulfillment_ledger.json`. Run the worked scenarios with
+`python examples/run_examples.py`.
 
-Set `WMS_MCP_URL` / `TMS_MCP_URL` / `ERP_MCP_URL` / `FLEET_API_MCP_URL`
-in `.env` as you swap each agent for the live system; until then the
-store-grounded agents read the seeded dev store (`agency/_shared/store.py`)
-and the pure MCP connectors return empty contracts.
+> Packaging note: `pip install leafmesh` (core) includes all LLM providers and
+> runs the pod; `apscheduler` powers the cycle-count / scorecard `wake_up` crons.
+> For the real WMS/TMS/ERP connectors add `leafmesh[mcp]`. Avoid `leafmesh[all]`
+> on Python 3.12+ (it pulls `cchardet`, which has no wheel) — add only the
+> specific extras you need.
+
+---
+
+*Built with `create-leafmesh`. The config is the department; the PRD is the brief.*
+*Design doctrine: `claude_skills/leafmesh/building-agents-thoroughly.md`.*

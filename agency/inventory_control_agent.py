@@ -26,9 +26,35 @@ from typing import Any
 
 from leafmesh import LeafMeshLogger, chain, pre_compose
 
-from agency._shared import shrink_math, store
+from agency._shared import session_stash, shrink_math, store
 
 logger = LeafMeshLogger(__name__)
+
+
+def _instance_id(input_data: dict[str, Any], context: Any) -> int:
+    """Which parallel copy is this (2.4.118+)? 0 when not fanned out."""
+    for src in (input_data, context if isinstance(context, dict) else {}):
+        inst = src.get("_instance") if isinstance(src, dict) else None
+        if isinstance(inst, dict) and inst.get("id") is not None:
+            try:
+                return int(inst["id"])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _counts_from_claim(claimed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn a claimed batch of SKU records into cycle counts. Dev: physical =
+    system, minus the seeded shrink on the short SKU so the demo exercises the
+    over-tolerance path."""
+    counts = []
+    for rec in claimed:
+        sys_q = int(rec.get("on_hand", 0))
+        phys = sys_q if rec.get("sku") != "SKU-7700" else max(0, sys_q - 1)
+        counts.append({"sku": rec.get("sku"), "zone": rec.get("zone"),
+                       "bin": rec.get("bin"), "system_qty": sys_q,
+                       "physical_qty": phys})
+    return counts
 
 
 def _ctx(context: Any) -> dict[str, Any]:
@@ -91,8 +117,21 @@ async def inventory_control_agent(llm_response: Any, input_data: dict[str, Any],
                                   context: dict[str, Any]) -> dict[str, Any]:
     input_data = input_data if isinstance(input_data, dict) else {}
     pctx = _ctx(context)
-    counts = pctx.get("counts") or _counts_from_input(input_data)
     mode = str(pctx.get("mode") or input_data.get("mode") or "count")
+
+    # Parallel-instance sweep: each copy claims a DISJOINT batch of SKUs from the
+    # per-session backlog (atomic) so the copies split the work. A single (non-
+    # fanned) run or an explicit ingest falls through to the normal path.
+    if mode == "count" and not input_data.get("sku") and not input_data.get("counts"):
+        sid = session_stash.resolve_session_id(input_data, context)
+        claimed = store.claim_count_batch(sid, batch_size=2)
+        counts = _counts_from_claim(claimed) if claimed else \
+            (pctx.get("counts") or _counts_from_input(input_data))
+        if claimed:
+            logger.info(f"[inv-control] instance {_instance_id(input_data, context)} "
+                        f"claimed {len(claimed)} SKU(s)")
+    else:
+        counts = pctx.get("counts") or _counts_from_input(input_data)
 
     recon = shrink_math.reconcile(counts)
     over = recon["over_tolerance_count"]
