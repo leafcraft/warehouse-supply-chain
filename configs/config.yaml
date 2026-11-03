@@ -11,8 +11,9 @@
 # and is the single point of contact; SPECIALISTS that each do one job; a
 # FINISHER (shipment_dispatcher) that re-checks a release token, enforces
 # deterministic invariants, renders the real shipping manifest to ./out, and
-# fails closed (delete-on-block); first-class HUMAN members reached in their own
-# channel whose gates DEFAULT-DENY on silence; and the Manager as SUPERVISOR.
+# fails closed (delete-on-block); first-class HUMAN members answering in Studio's
+# Inbox — nothing is released or approved on their silence; and the Manager as
+# SUPERVISOR.
 # Systems of record (WMS / TMS / ERP / fleet API) are TOOLS inside agents —
 # commented mcp blocks + dev-store fallbacks that announce themselves — never
 # members. Every wire is conditional; silence never advances anything.
@@ -28,26 +29,18 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 604800
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates stalls
-# / contract violations / repeated errors to the Warehouse Manager (the
-# accountable human). It is NOT a router in the middle of the team.
+# The Manager is the SUPERVISOR, not a router in the middle of the team (static
+# routing). It escalates to the Warehouse Manager (the accountable human) on a
+# non-retryable error (auth / bad request / credit / bad config), when 3
+# different agents fail in one order (max_errors_per_session), or when restarts
+# run out. A malformed hand-off only alerts. A question nobody answers is NOT
+# escalated: the card closes and the ticket records that no reply came. Floor
+# exceptions, shrink and the dispatch release reach people via can_call wires.
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -59,50 +52,53 @@ manager:
     Standing roles run alongside: cycle-count / shrink control, returns,
     replenishment, supplier relations, humanoid-fleet telemetry.
 
-    Escalate to the Warehouse Manager when: an order loops on re-inspection past
-    its bound, a safety / damage / high-value exception is raised, a release gate
-    times out, cycle-count shrink runs systematic, or any agent hands off a
-    malformed artifact. Silence never advances an order.
+    The team's own wires send safety / damage / high-value exceptions to the
+    Ops Supervisor, and systematic cycle-count shrink and a carton worth $500
+    or more to the Warehouse Manager. You escalate to the Warehouse Manager
+    when agents keep failing. Silence never advances an order.
   routing:
     mode: static
   escalation:
     targets:
       - type: "human_agent"
         agent: "warehouse_manager_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{order_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live, no restart).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{order_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 120
 
 # 2.4.131 runtime block — proof/plan-heavy agents (the supplier super-agent, the
 # coordinator) can run long. The 2.4.131 default dropped to 90s; raise it. NOTE:
 # the `timeouts` block is REJECTED by <=2.4.130 — it must ship WITH the 2.4.131
 # floor in requirements.txt, never before.
 timeouts:
+  mesh_call_default_timeout_s: 120
   llm_hard_timeout_s: 300
 
 # Event listeners (BRD-021) — the coordinator also wakes on order events written
 # to a Redis stream by the OMS. Redis Streams uses the core redis dep (no extra).
-# Distinct from the SDK's primary Redis above; point ${ORDER_EVENTS_REDIS_URL} at
-# the stream the OMS publishes to.
-brokers:
-  order_events:
-    type: redis_streams
-    url: "${ORDER_EVENTS_REDIS_URL:redis://localhost:6379}"
-    db: 1
+# Distinct from the SDK's primary Redis above; the stream's address lives in
+# the vault connection 'order_events' (never here).
+# brokers:
+  # Day 0 this broker is off: create the vault connection 'order_events' on
+  # Infrastructure → Brokers & queues → Redis Streams, then uncomment it and
+  # its agents' listen_events — here before the first start, in Studio's YAML
+  # editor after it (applies live, no restart).
+  # order_events:
+    # type: redis_streams
+    # connection: order_events   # vault connection (Infrastructure → Brokers & queues → Redis Streams) holds the address
+    # db: 1
 
 data_structures:
   OrderEvent:
@@ -230,7 +226,9 @@ agents:
       On a new order: open it, record the received time, hand it to allocation.
       On a status ask: answer current stage / waiting-on / next gate from the
       order record — nothing invented. Route any specialist's blocking exception
-      to the Warehouse Manager; never make the floor call yourself.
+      to the Warehouse Manager; never make the floor call yourself. When the Ops
+      Supervisor escalates a floor exception to you (human_message "escalate"),
+      your action is escalate — the Warehouse Manager takes it from there.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"action": ..., "order_id": ..., "stage": ..., "waiting_on": ..., "summary": ...}
@@ -244,13 +242,14 @@ agents:
       order: "object"
       order_id: "string"
       message: "string"
+      human_message: "string"   # an Ops Supervisor escalation arrives here
     # Order events (BRD-021) — the OMS writes order.created events to a Redis
     # stream; the Coordinator consumes them in parallel with the webhook entry.
-    listen_events:
-      - broker: order_events
-        stream: "orders.created"
-        consumer_group: "fulfillment-coordinator"
-        batch_size: 10
+    # listen_events:
+      # - broker: order_events
+        # stream: "orders.created"
+        # consumer_group: "fulfillment-coordinator"
+        # batch_size: 10
     can_call:
       - agent: "allocation_agent"
         condition: "calling_agent_response.action == 'open_order'"
@@ -296,7 +295,8 @@ agents:
   # ─────────────────────────────────────────────────────────────────────────
   # inventory_agent — confirms stock + reserves units. Store-grounded day-0
   # (agency/inventory_agent.py reserves against the seeded WMS and announces
-  # available:false when a SKU is unknown); wire the WMS by uncommenting mcp.
+  # available:false when a SKU is unknown); wire the WMS by uncommenting its
+  # integration: mcp block (here before the first start, Studio's YAML editor after).
   # ─────────────────────────────────────────────────────────────────────────
   inventory_agent:
     name: "inventory_agent"
@@ -311,16 +311,22 @@ agents:
     inputs:
       pick_plan: "list"
       payload: "object"
-    # ── To wire the real WMS, uncomment and set the URL. NOTE: the SDK rejects
-    #    an http mcp block with an EMPTY url at load, so this ships COMMENTED —
-    #    fill the URL, then uncomment. Until then the dev-store body answers. ──
-    # mcp:
-    #   - transport: http
-    #     url: "${WMS_MCP_URL}"
-    #     token: "${WMS_MCP_TOKEN:}"
-    #     use: [check_and_reserve_stock]
-    #     name: wms
-    #     timeout: 30
+    # ── To wire the real WMS: create the vault connection 'wms_mcp' on
+    #    Infrastructure → Integrations → MCP (or an "Add custom" record, service
+    #    type Tools, base URL = the MCP server's address; its token lives
+    #    there too, never here), then uncomment — here before the first start,
+    #    in Studio's YAML editor after it. The same connection serves every WMS block
+    #    below. Until then the dev-store body answers. ──
+    # A programmatic agent takes its connector as `integration:` +
+    # `connector_config:` (an `mcp:` list is refused on agent_type
+    # programmatic). The connector's response is handed to this agent's
+    # Python body as its first argument — adapt the body before uncommenting.
+    # integration: mcp
+    # connector_config:
+    #   connection: wms_mcp   # vault connection holds the URL + token
+    #   transport: http
+    #   tool_name: check_and_reserve_stock
+    #   timeout: 30
     can_call:
       - agent: "exception_agent"
         condition: "calling_agent_response.all_in_stock == false"
@@ -487,14 +493,21 @@ agents:
       weight_kg: "number"
       destination: "object"
       sla_days: "number"
-    # ── Wire the real TMS by uncommenting (fill the URL first). ──
-    # mcp:
-    #   - transport: http
-    #     url: "${TMS_MCP_URL}"
-    #     token: "${TMS_MCP_TOKEN:}"
-    #     use: [select_carrier]
-    #     name: tms
-    #     timeout: 30
+      carrier_down: "string"            # failover: this carrier is excluded
+    # ── Wire the real TMS: create the vault connection 'tms_mcp' on
+    #    Infrastructure → Integrations → MCP (or an "Add custom" record, service
+    #    type Tools), then uncomment — here before the first start, in Studio's
+    #    YAML editor after it (applies live, no restart). ──
+    # A programmatic agent takes its connector as `integration:` +
+    # `connector_config:` (an `mcp:` list is refused on agent_type
+    # programmatic). The connector's response is handed to this agent's
+    # Python body as its first argument — adapt the body before uncommenting.
+    # integration: mcp
+    # connector_config:
+    #   connection: tms_mcp   # vault connection holds the URL + token
+    #   transport: http
+    #   tool_name: select_carrier
+    #   timeout: 30
     can_call:
       - agent: "shipment_dispatcher_agent"
         condition: "calling_agent_response.sla_met == true"
@@ -571,13 +584,16 @@ agents:
       available: "boolean"
     inputs:
       payload: "object"
-    # mcp:
-    #   - transport: http
-    #     url: "${WMS_MCP_URL}"
-    #     token: "${WMS_MCP_TOKEN:}"
-    #     use: [process_return]
-    #     name: wms
-    #     timeout: 30
+    # A programmatic agent takes its connector as `integration:` +
+    # `connector_config:` (an `mcp:` list is refused on agent_type
+    # programmatic). The connector's response is handed to this agent's
+    # Python body as its first argument — adapt the body before uncommenting.
+    # integration: mcp
+    # connector_config:
+    #   connection: wms_mcp   # vault connection holds the URL + token
+    #   transport: http
+    #   tool_name: process_return
+    #   timeout: 30
     can_call:
       - agent: "inventory_agent"
         condition: "calling_agent_response.return_status == 'restocked'"
@@ -586,10 +602,10 @@ agents:
 
   # ═════════════════════════════════════════════════════════════════════════
   # inventory_control_agent — cycle counts, ingest, shrink reconciliation.
-  # PARALLEL INSTANCES (2.4.118+): a nightly sweep fans out into copies, each
+  # PARALLEL COPIES (scaling.copies): a nightly sweep fans out into copies, each
   # claiming a DISJOINT batch of SKUs via the atomic claim
   # (agency/_shared/store.claim_count_batch) so copies split the backlog instead
-  # of duplicating it. instances_handoff: last combines the copies — counts SUM
+  # of duplicating it. copies.handoff: last combines the copies — counts SUM
   # (correct: skus_counted / over_tolerance_count are additive). The per-copy
   # @chain enforce_shrink_floor re-asserts the 2% tolerance + manager-attention
   # floor on its OWN batch; the combined max_variance_pct is a summed ratio, so
@@ -602,8 +618,11 @@ agents:
     agent_type: "programmatic"
     communication_type: "chain"
     description: "Inventory control — cycle counts, ingest, reconciliation; parallel-instance sweep; shrink floor."
-    instances: 3
-    instances_handoff: last
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3
+        handoff: last
     wake_up: "0 3 * * *"
     timezone: "America/Denver"
     wake_up_input:
@@ -631,13 +650,16 @@ agents:
       system_qty: "number"
       physical_qty: "number"
       counter_id: "string"
-    # mcp:
-    #   - transport: http
-    #     url: "${WMS_MCP_URL}"
-    #     token: "${WMS_MCP_TOKEN:}"
-    #     use: [get_cycle_count_results]
-    #     name: wms
-    #     timeout: 30
+    # A programmatic agent takes its connector as `integration:` +
+    # `connector_config:` (an `mcp:` list is refused on agent_type
+    # programmatic). The connector's response is handed to this agent's
+    # Python body as its first argument — adapt the body before uncommenting.
+    # integration: mcp
+    # connector_config:
+    #   connection: wms_mcp   # vault connection holds the URL + token
+    #   transport: http
+    #   tool_name: get_cycle_count_results
+    #   timeout: 30
     can_call:
       - agent: "exception_agent"
         condition: "calling_agent_response.max_variance_pct > 0.02"
@@ -675,13 +697,20 @@ agents:
       lead_time_days: "number"
       supplier_id: "string"
       delta: "number"
-    # mcp:
-    #   - transport: http
-    #     url: "${ERP_MCP_URL}"
-    #     token: "${ERP_MCP_TOKEN:}"
-    #     use: [get_reorder_recommendations]
-    #     name: erp
-    #     timeout: 30
+    # ── Wire the real ERP/SRM: create the vault connection 'erp_mcp' on
+    #    Infrastructure → Integrations → MCP (or an "Add custom" record, service
+    #    type Tools), then uncomment — here before the first start, in Studio's
+    #    YAML editor after it (applies live, no restart). ──
+    # A programmatic agent takes its connector as `integration:` +
+    # `connector_config:` (an `mcp:` list is refused on agent_type
+    # programmatic). The connector's response is handed to this agent's
+    # Python body as its first argument — adapt the body before uncommenting.
+    # integration: mcp
+    # connector_config:
+    #   connection: erp_mcp   # vault connection holds the URL + token
+    #   transport: http
+    #   tool_name: get_reorder_recommendations
+    #   timeout: 30
     can_call:
       - agent: "ops_supervisor_human"
         condition: "calling_agent_response.critical_stockout_count > 0"
@@ -727,7 +756,10 @@ agents:
 
       Load the `supplier_playbook` for the exact onboarding / sourcing /
       scorecard rules. Use lookup_supplier / find_alternates for on-demand
-      lookups the pulled context did not already carry.
+      lookups the pulled context did not already carry. steps_complete,
+      steps_remaining and suppliers_requiring_action are lists of ids; each
+      shortlist item is {"supplier_id", "lead_time_days", "preferred"}; each
+      scorecards item is {"supplier_id", "grade", "requires_action"}.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"mode": "", "supplier_id": "", "legal_name": "", "category": "", "status": "", "rejection_reason": "", "steps_complete": [], "steps_remaining": [], "esg_risk": "", "kyc_status": "", "banking_verified": false, "insurance_required": false, "insurance_provided": false, "requires_procurement_lead_approval": false, "requires_compliance_review": false, "updated_at_utc": "", "run_id": "", "sku": "", "reason": "", "preferred_count": 0, "market_count": 0, "shortlist": [], "shortlist_size": 0, "requires_rfq": false, "requires_procurement_lead": false, "no_qualified_alternates": false, "generated_at_utc": "", "period": "", "scorecards": [], "scorecard_count": 0, "suppliers_requiring_action": [], "action_count": 0, "requires_procurement_lead_review": false}
@@ -773,8 +805,8 @@ agents:
       category: "string"
       status: "string"
       rejection_reason: "string"
-      steps_complete: "list"
-      steps_remaining: "list"
+      steps_complete: {type: array, items: string}
+      steps_remaining: {type: array, items: string}
       esg_risk: "string"
       kyc_status: "string"
       banking_verified: "boolean"
@@ -788,16 +820,16 @@ agents:
       reason: "string"
       preferred_count: "number"
       market_count: "number"
-      shortlist: "list"
+      shortlist: {type: array, items: {type: object, fields: {supplier_id: string, lead_time_days: number, preferred: boolean}}}
       shortlist_size: "number"
       requires_rfq: "boolean"
       requires_procurement_lead: "boolean"
       no_qualified_alternates: "boolean"
       generated_at_utc: "string"
       period: "string"
-      scorecards: "list"
+      scorecards: {type: array, items: {type: object, fields: {supplier_id: string, grade: string, requires_action: boolean}}}
       scorecard_count: "number"
-      suppliers_requiring_action: "list"
+      suppliers_requiring_action: {type: array, items: string}   # supplier ids
       action_count: "number"
       requires_procurement_lead_review: "boolean"
     inputs:
@@ -832,7 +864,7 @@ agents:
   humanoid_status_agent:
     name: "humanoid_status_agent"
     agent_type: "programmatic"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "Humanoid fleet telemetry — battery / fault / location (store-grounded; fleet-API swap in PROD)."
     yields:
       total_units: "number"
@@ -848,17 +880,24 @@ agents:
         condition: "always"
 
   # ═════════════════════════════════════════════════════════════════════════
-  # HUMAN members — first-class, reached in their own channel (webhook). Every
-  # gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
-  # `dual` belongs on the human/webhook boundary agent ONLY; they never call
-  # each other (a dual->dual edge auto-bounces — gotcha #17). Human->human
-  # escalation is handled by the Manager SUPERVISOR (manager.escalation), not a
-  # hardcoded wire.
+  # HUMAN members — first-class, answering in Studio's Inbox. Timeouts follow
+  # the floor: the Ops Supervisor answers a floor exception within 30 min; the
+  # Warehouse Manager answers a dispatch release within 2h, inside the same
+  # day's carrier cut-off.
+  # If nobody answers in time, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nothing is released or
+  # approved on silence, and nobody is chased automatically. fallback_on_timeout
+  # / fallback_response state the intended default-deny (held_for_review ->
+  # audit); leafmesh 2.4.486 does not route it for these dual seats yet.
+  # Every value a seat asks for has a route. `dual` belongs on the human
+  # boundary agent ONLY; they never call each other (a dual->dual edge
+  # auto-bounces — gotcha #17). The supervisor's "escalate" goes to the
+  # Coordinator, which hands it to the Warehouse Manager.
   # ═════════════════════════════════════════════════════════════════════════
   ops_supervisor_human:
     name: "ops_supervisor_human"
     agent_type: "human"
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 1800          # 30 min — floor exceptions need fast response
     description: "Ops Supervisor — floor decisions, exceptions, safety, humanoid faults."
@@ -867,49 +906,44 @@ agents:
       human_decision: held
       human_message: held_for_review
       message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     yields:
       human_message: "string"            # resolved | escalate | held_for_review
     inputs:
       order_id: "string"
       exception: "object"
     can_call:
+      # Beyond the supervisor's authority → the Coordinator, which escalates it
+      # to the Warehouse Manager (a human never calls a human directly).
+      - agent: "fulfillment_coordinator_agent"
+        condition: "calling_agent_response.human_message == 'escalate'"
       - agent: "warehouse_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'resolved' or calling_agent_response.human_message == 'held_for_review'"
 
   warehouse_manager_human:
     name: "warehouse_manager_human"
     agent_type: "human"
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 14400         # 4 h — tier-2 governance + dispatch release
-    description: "Warehouse Manager — accountable owner: dispatch release, tier-2 governance, supplier gates, shrink."
+    human_timeout_seconds: 7200          # 2 h — a dispatch release must clear the day's carrier cut-off
+    description: "Warehouse Manager — accountable owner: dispatch release of a $500+ carton, supplier gates, systematic shrink."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
       message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     yields:
       human_message: "string"            # approved | rejected | held_for_review
     inputs:
       order_id: "string"
       carton_id: "string"
     can_call:
+      # A dispatch release the dispatcher asked for → back to the dispatcher.
       - agent: "shipment_dispatcher_agent"
-        condition: "calling_agent_response.human_message == 'approved'"
+        condition: "calling_agent_response.human_message == 'approved' and calling_agent_response.from_agent == 'shipment_dispatcher_agent'"
+      # Every other approval (supplier gate, shrink, escalation) is a decision
+      # on record; rejected / held are recorded too. Nothing ships from here.
       - agent: "warehouse_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "(calling_agent_response.human_message == 'approved' and calling_agent_response.from_agent != 'shipment_dispatcher_agent') or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
 
   # ═════════════════════════════════════════════════════════════════════════
   # WORM audit sink — hash-chained, append-only, the terminus of every path.
@@ -919,7 +953,7 @@ agents:
     name: "warehouse_audit_logger_agent"
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "WORM audit — hash-chains every pick, pack, ship, exception, humanoid action, and held gate. Terminus."
     connector_config:
       sink_type: "local_file"

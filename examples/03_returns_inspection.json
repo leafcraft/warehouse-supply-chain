@@ -1,13 +1,13 @@
 {
   "_entry_point": "return_received",
-  "_description": "Returned item arrived \u2014 inspection_humanoid evaluates condition, returns_handler routes to restock or quarantine.",
-  "return_payload": {
-    "return_id": "ret-2026-0604-0048",
-    "original_order_id": "ord-2026-0521-0211",
-    "customer_id": "c-3128",
-    "sku": "SKU-PUMP-08",
+  "_description": "Customer returns one unopened pair of Trail Runner 42 from ORD-4471 — returns_handler_agent dispositions it as restock and puts the unit back into available stock (an opened unit would go to refurbish, a damaged one to scrap).",
+  "payload": {
+    "return_id": "RMA-2026-0618-0048",
+    "original_order_id": "ORD-4471",
+    "customer_id": "CUST-Maria-Denver",
+    "sku": "SKU-9001",
     "quantity": 1,
-    "reason_code": "doa_defective",
-    "customer_notes": "Unit didn't power on out of the box."
+    "condition": "unopened",
+    "reason_code": "wrong_size"
   }
 }

@@ -7,8 +7,9 @@ Also absorbs an inbound restock (restock_event / a restocked return).
 Store-grounded so the chain runs day-0 with NO connector wired: reads/writes the
 seeded inventory in agency/_shared/store.py and **announces itself** — an unknown
 SKU returns available:false, never a synthetic reservation. In PROD swap the body
-for the WMS call (uncomment the mcp block in config.yaml, tool
-check_and_reserve_stock); the yields are the contract.
+for the WMS call (uncomment its `integration: mcp` connector block, tool
+check_and_reserve_stock — in configs/config.yaml before the first start, in
+Studio's YAML editor after it); the yields are the contract.
 """
 from __future__ import annotations
 

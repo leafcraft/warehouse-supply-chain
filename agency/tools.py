@@ -5,8 +5,9 @@ in the turn, when the @pre_compose context did not already carry what it needs.
 Each reads the dev store (seeded ERP/SRM) so the pod runs with NO connector
 wired, and **each announces itself**: when there is no real source and no seed,
 it returns `available: false` and says why — never a synthetic success that looks
-like a real read. To go live, wire the ERP/SRM mcp block in config.yaml; these
-dev tools are the fallback contract.
+like a real read. To go live, create the vault record 'erp_mcp' and wire the
+ERP/SRM connector in config.yaml; these dev tools are the fallback contract.
+They check that vault record themselves; nothing is read from .env.
 """
 from __future__ import annotations
 
@@ -16,21 +17,24 @@ from leafmesh import LeafMeshLogger, global_tool
 
 try:
     from ._shared import store
+    from ._shared.wiring import vault_record_exists
 except ImportError:  # pragma: no cover — direct-run fallback
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _shared import store  # type: ignore
+    from _shared.wiring import vault_record_exists  # type: ignore
 
 logger = LeafMeshLogger(__name__)
 
 
-def _erp_wired() -> bool:
-    """True if a real ERP/SRM connector is configured."""
-    return bool(os.getenv("ERP_MCP_URL"))
+async def _erp_wired() -> bool:
+    """True once the vault record 'erp_mcp' exists (Infrastructure →
+    Integrations → MCP)."""
+    return await vault_record_exists("erp_mcp")
 
 
 @global_tool(category="supplier")
-def lookup_supplier(supplier_id: str) -> dict:
+async def lookup_supplier(supplier_id: str) -> dict:
     """Look up one supplier's master record, current scorecard and trailing
     performance history — for onboarding state and scorecard trend reasoning.
 
@@ -42,16 +46,16 @@ def lookup_supplier(supplier_id: str) -> dict:
     """
     rec = store.get_supplier(str(supplier_id or "").strip())
     if not rec:
-        reason = ("connector wired but returned nothing for this supplier"
-                  if _erp_wired()
-                  else f"no seed supplier {supplier_id!r}; wire ERP_MCP_URL")
+        reason = ("ERP record 'erp_mcp' exists, but this dev tool reads only the seed"
+                  if await _erp_wired()
+                  else f"no seed supplier {supplier_id!r}; create vault record 'erp_mcp' for the live ERP/SRM")
         return {"available": False, "reason": reason}
     logger.info(f"lookup_supplier {supplier_id} available=True")
     return {"available": True, "supplier": rec}
 
 
 @global_tool(category="supplier")
-def find_alternates(category: str, esg_floor: str = "medium") -> dict:
+async def find_alternates(category: str, esg_floor: str = "medium") -> dict:
     """Find qualified alternate suppliers serving a category at/above an ESG
     floor — the sourcing responsibility's candidate pool.
 
@@ -66,7 +70,10 @@ def find_alternates(category: str, esg_floor: str = "medium") -> dict:
     if not category:
         return {"available": False, "reason": "no category given"}
     candidates = store.suppliers_for_category(category, str(esg_floor or "medium"))
-    if not candidates and not _erp_wired():
-        return {"available": False,
-                "reason": f"no seed alternates for {category!r}; wire ERP_MCP_URL"}
+    if not candidates:
+        # Never report "no qualified alternates" from a seed that simply has none.
+        reason = ("ERP record 'erp_mcp' exists, but this dev tool reads only the seed"
+                  if await _erp_wired() else
+                  f"no seed alternates for {category!r}; create vault record 'erp_mcp' for the live ERP/SRM")
+        return {"available": False, "reason": reason}
     return {"available": True, "category": category, "candidates": candidates}

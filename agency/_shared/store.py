@@ -12,16 +12,18 @@ inspect → pack → ship, plus the damage-exception path:
   * ERP        → SKU master / reorder points (replenishment_planner_agent)
 
 Each function below is the CONTRACT the matching connector must honour.
-In prod, replace the body with the MCP call (point ${WMS_MCP_URL} /
-${TMS_MCP_URL} / ${ERP_MCP_URL} / ${FLEET_API_MCP_URL} at your gateway);
-the return shape is identical. Setting the env var alone does nothing
-until you wire the call here.
+In prod, replace the body with the MCP call (a connector picking the vault
+connection wms_mcp / tms_mcp / erp_mcp / your fleet gateway's connection);
+the return shape is identical. Creating the connection alone does
+nothing until you wire the call here.
 
-Day-0 demo: the seed below carries one realistic order (ORD-4471) whose
-two SKUs sit in bins A-014 / C-103, one fully-stocked SKU and one
-short-stocked SKU (to exercise the out-of-stock allocation gate), a
-three-unit humanoid fleet (one on low battery), an open outbound
-shipment, and a carrier rate table.
+Day-0 demo: the seed below carries three orders, one per route —
+ORD-4471 (two in-stock lines, $208: the routine path that self-releases),
+ORD-4490 (5 × a SKU with 1 free unit: the availability gate), ORD-4512
+(5 × trail runners, $595: at the $500 declared-value line, so the dispatch
+release goes to the Warehouse Manager) — plus a five-unit humanoid fleet
+(one picker on low battery), a carrier rate table, and three suppliers
+(one solid, one with a quality slide, one market alternate).
 """
 from __future__ import annotations
 
@@ -80,10 +82,10 @@ _SEED_INVENTORY = {
     # critical-stockout floor (replenishment) and the exception
     # severity/value floor: a damage/loss on this line can't be
     # down-rated to a front-line resolve.
-    "SKU-3300": {"sku": "SKU-3300", "description": "Alpine Pro Optic 1L",
+    "SKU-3300": {"sku": "SKU-3300", "description": "Alpine Pro Down Parka",
                  "zone": "A", "bin": "A-051", "on_hand": 0, "reserved": 0,
-                 "reorder_point": 20, "target_qty": 120, "unit_weight_kg": 0.3,
-                 "lead_time_days": 5, "supplier_id": "SUP-1001",
+                 "reorder_point": 20, "target_qty": 120, "unit_weight_kg": 1.1,
+                 "lead_time_days": 7, "supplier_id": "SUP-1001",
                  "unit_value_cents": 64900},
 }
 
@@ -108,6 +110,17 @@ _SEED_ORDERS = {
                     "postal_code": "78701", "country": "US"},
         "line_items": [
             {"sku": "SKU-7700", "quantity": 5},   # available 1 < 5 → gate
+        ],
+    },
+    # ORD-4512 — 5 × SKU-9001 at $119 = $595 declared value, over the $500
+    # line: the carton cannot self-release; the Warehouse Manager releases it.
+    "ORD-4512": {
+        "order_id": "ORD-4512", "customer_id": "CUST-Okafor-Boulder",
+        "ship_method": "standard", "received_at_utc": "2026-06-23T16:12:00Z",
+        "ship_to": {"name": "Dayo O.", "city": "Boulder", "state": "CO",
+                    "postal_code": "80302", "country": "US"},
+        "line_items": [
+            {"sku": "SKU-9001", "quantity": 5},
         ],
     },
 }
@@ -148,8 +161,8 @@ DEFAULT_CARRIER_CENTS = 1800   # the un-shopped default this agency beats
 # solid A; SUP-1002 has a quality slide (rising defect PPM, slipping
 # on-time) so the scorecard fires requires_action; SUP-2003 is a market
 # alternate carried for the sourcing responsibility. In PROD swap the
-# bodies below for the SRM/ERP read (point ${ERP_MCP_URL} at your
-# gateway, tool get_supplier_scorecards) — the return shape is identical.
+# bodies below for the SRM/ERP read (a connector picking your ERP/SRM
+# vault connection, tool get_supplier_scorecards) — the return shape is identical.
 _SEED_SUPPLIERS = {
     "SUP-1001": {
         "supplier_id": "SUP-1001", "legal_name": "Summit Outfitters LLC",
@@ -228,6 +241,16 @@ def _fleet() -> dict[str, Any]:
 def get_order(order_id: str) -> dict[str, Any]:
     """The order header + lines. PROD: OMS read."""
     return dict(_orders().get(str(order_id or ""), {}))
+
+
+def order_value_cents(order_id: str) -> int:
+    """Declared value of an order: Σ quantity × unit value. The dispatch
+    release gate reads it. PROD: OMS order total (merchandise value)."""
+    total = 0
+    for li in get_order(order_id).get("line_items") or []:
+        if isinstance(li, dict):
+            total += int(li.get("quantity") or 0) * int(get_sku(li.get("sku")).get("unit_value_cents") or 0)
+    return total
 
 
 # ── Inventory / bins (WMS) ───────────────────────────────────────────
@@ -313,9 +336,26 @@ def carrier_rates() -> list[dict[str, Any]]:
 
 
 # ── Shipments (audit/handoff scratch) ────────────────────────────────
+# One carton already packed for ORD-4471 (1 × 0.6 kg + 1 × 0.9 kg = 1.5 kg),
+# waiting on a carrier — what the carrier-outage failover re-shops.
+_SEED_SHIPMENTS = {
+    "ctn-4471-01": {"order_id": "ORD-4471", "carton_id": "ctn-4471-01",
+                    "at": "2026-06-23T15:02:00Z", "weight_kg": 1.5, "units": 2,
+                    "stage": "packed"},
+}
+
+
+def _shipments() -> dict[str, Any]:
+    s = _load("shipments")
+    if not s:
+        s = {k: dict(v) for k, v in _SEED_SHIPMENTS.items()}
+        _save("shipments", s)
+    return s
+
+
 def record_shipment(order_id: str, carton_id: str, payload: dict[str, Any]) -> None:
     with _LOCK:
-        s = _load("shipments")
+        s = _shipments()
         s[str(carton_id or order_id)] = {"order_id": order_id,
                                          "carton_id": carton_id,
                                          "at": _now(), **(payload or {})}
@@ -323,7 +363,7 @@ def record_shipment(order_id: str, carton_id: str, payload: dict[str, Any]) -> N
 
 
 def get_shipment(carton_id: str) -> dict[str, Any]:
-    return dict(_load("shipments").get(str(carton_id or ""), {}))
+    return dict(_shipments().get(str(carton_id or ""), {}))
 
 
 # ── Outbox (the dispatcher's sends) + append-only ledger ─────────────
@@ -349,10 +389,10 @@ def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
     return rec
 
 
-# ── Atomic claim for the cycle-count instance fan-out ────────────────
+# ── Atomic claim for the cycle-count copies fan-out ────────────────
 def claim_count_batch(session_id: str, batch_size: int = 1) -> list[dict[str, Any]]:
     """Atomically pop up to batch_size SKUs from a per-session cycle-count
-    backlog, so parallel `instances` of inventory_control split the work instead
+    backlog, so parallel copies (`scaling.copies`) of inventory_control split the work instead
     of duplicating it. The backlog is seeded once from the SKU master; each copy
     calls this and receives a DISJOINT batch. PROD: an atomic WMS queue pop
     (LPOP N / UPDATE ... SKIP LOCKED RETURNING)."""
