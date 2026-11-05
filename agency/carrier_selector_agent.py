@@ -6,7 +6,7 @@ DEEP (store-grounded + deterministic rate-shop floor):
               shipment store when only a carton_id arrived) and the
               carrier rate table BEFORE selection. In dev from
               agency/_shared/store.py (seeded rates); in prod from the TMS
-              (${TMS_MCP_URL}, tool select_carrier). Self-reliant: the
+              (vault connection tms_mcp, tool select_carrier). Self-reliant: the
               planner fetches the weight + rates itself.
 
 @chain        enforce_rate_shop_floor — the deterministic CARRIER
@@ -74,6 +74,13 @@ async def enforce_rate_shop_floor(result: dict[str, Any], ctx: Any) -> dict[str,
     return result
 
 
+def _carrier_down(input_data: dict[str, Any]) -> str:
+    """The carrier that is out (the carrier_outage_failover entry sends it)."""
+    up = input_data.get("upstream_yields") or {}
+    return str(input_data.get("carrier_down") or input_data.get("primary_carrier")
+               or (up.get("carrier_down") if isinstance(up, dict) else "") or "").strip().lower()
+
+
 @pre_compose(context_processor=load_rate_context)
 @chain(enforce_rate_shop_floor)
 async def carrier_selector_agent(llm_response: Any, input_data: dict[str, Any],
@@ -89,7 +96,13 @@ async def carrier_selector_agent(llm_response: Any, input_data: dict[str, Any],
               or (input_data.get("upstream_yields") or {}).get("sla_days")
               or DEFAULT_SLA_DAYS)
 
+    down = _carrier_down(input_data)
+    if down:
+        # Failover: the carrier that is out is not an option for any service level.
+        rates = [r for r in rates if str(r.get("carrier") or "").lower() != down]
     shopped = carrier_math.rate_shop(rates, weight, sla, store.DEFAULT_CARRIER_CENTS)
+    if down:
+        shopped["rationale"] = f"{shopped['rationale']}; {down} out — excluded"
     # carry the transit days for the floor to re-derive sla_met
     chosen = next((r for r in rates
                    if r.get("carrier") == shopped["selected_carrier"]

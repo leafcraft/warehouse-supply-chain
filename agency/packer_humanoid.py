@@ -52,8 +52,12 @@ async def packer_humanoid(llm_response: Any, input_data: dict[str, Any],
                 or 0)
     carton_id = f"ctn-{uuid.uuid4().hex[:10]}"
     weight = round(units * AVG_UNIT_KG, 2)
+    up = input_data.get("upstream_yields") or {}
     order_id = str(input_data.get("order_id")
-                   or (input_data.get("upstream_yields") or {}).get("order_id") or "")
+                   or (up.get("order_id") if isinstance(up, dict) else "")
+                   or next((v.get("order_id") for v in (up.values() if isinstance(up, dict) else [])
+                            if isinstance(v, dict) and v.get("order_id")), "")
+                   or "")
 
     # ACTUATOR — record the carton so loader/carrier can read it.
     store.record_shipment(order_id, carton_id,

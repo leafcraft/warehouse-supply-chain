@@ -49,7 +49,7 @@ async def replenishment_planner_agent(llm_response: Any, input_data: dict[str, A
     if not skus:
         return {"mode": "reorder_sweep", "total_skus": 0,
                 "reorder_recommendations": [], "critical_stockout_count": 0,
-                "replenishment_briefing": "SKU master empty — wire ERP_MCP_URL.",
+                "replenishment_briefing": "SKU master empty — create vault record 'erp_mcp' and wire the ERP read.",
                 "available": False}
 
     recs: list[dict[str, Any]] = []
