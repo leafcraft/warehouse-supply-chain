@@ -17,7 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Register the @global_tool dev-store tools BEFORE from_yaml/start
+# Register the @global_tool dev-store tools BEFORE from_store/start
 import agency.tools  # noqa: F401
 from agency._shared import audit_logger as _audit_logger
 
@@ -66,9 +66,11 @@ async def main() -> int:
         print("No scenarios matched.")
         return 1
 
-    sdk = LeafMesh.from_yaml("configs/config.yaml")
+    from dotenv import load_dotenv
+    load_dotenv()
+    sdk = LeafMesh.from_store()
     # WORM audit sink — custom external agents attach via mesh.intelligence (2.4+),
-    # after from_yaml and before start.
+    # after from_store and before start.
     _audit_logger.register(sdk, "warehouse_audit_logger_agent")
     await sdk.start()
     try:

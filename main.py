@@ -1,6 +1,7 @@
 """warehouse-supply-chain — Warehouse / Supply Chain (with humanoid integration).
 
-Config-as-department: configs/config.yaml casts the roles, the wires
+Config-as-department: the agency's configuration (in the store; see Studio)
+casts the roles, the wires
 carry the deterministic policy floors, and the WMS / ERP connectors are
 the systems of record. The depth lives in agency/*_agent.py and
 agency/*_humanoid.py (auto-discovered): self-reliant @pre_compose context
@@ -18,12 +19,12 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
-import agency.tools  # noqa: F401 — registers @global_tool tools BEFORE from_yaml/start
+import agency.tools  # noqa: F401 — registers @global_tool tools BEFORE from_store/start
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external warehouse_audit_logger_agent (SDK 2.4+ API).
@@ -49,10 +50,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.MANAGER_INTERVENTION,  _on_manager_intervention)
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     logger.info("warehouse-supply-chain — Warehouse / Supply Chain mesh running")
 

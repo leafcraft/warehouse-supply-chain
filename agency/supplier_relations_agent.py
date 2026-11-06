@@ -8,7 +8,7 @@ DEEP (self-reliant — reasons over real performance data, not a blob):
               signal rows across all suppliers) from the source store
               BEFORE the LLM reasons. In dev these come from
               agency/_shared/store.py (seeded ERP/SRM); in prod from your
-              ERP/SRM (${ERP_MCP_URL}, tool get_supplier_scorecards). This
+              ERP/SRM (an ERP/SRM vault connection, tool get_supplier_scorecards). This
               is the self-reliant context pull: the relationship manager
               fetches its own authority — the actual on-time %, defect PPM
               trend, ESG/KYC state — instead of trusting a spoon-fed blob
@@ -17,7 +17,7 @@ DEEP (self-reliant — reasons over real performance data, not a blob):
               over the TREND it pulled.
 
 Pure-LLM body (no @chain): the onboarding/sourcing/scorecard FLOORS are
-deterministic wire conditions in config.yaml (esg_high / kyc_rejected /
+deterministic wire conditions in the configuration (esg_high / kyc_rejected /
 procurement-lead gates) — this module exists to make the agent
 self-reliant for its inputs, not to add a second floor.
 """
