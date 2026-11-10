@@ -1,6 +1,6 @@
 {
   "_entry_point": "order_placed",
-  "_description": "Over-demand on a short-stocked seeded SKU (avail 1 < 5) — allocation's deterministic AVAILABILITY GATE fires, blanks the picker dispatch, and routes the short line to exception_agent → supervisor.",
+  "_description": "Over-demand on a short-stocked seeded SKU (5 asked, 1 free) — allocation's deterministic AVAILABILITY GATE fires, blanks the picker dispatch, and routes the short line to exception_agent, which classifies it (front-line on an $89 line; the Ops Supervisor for damage, safety or a $500+ line).",
   "order": {
     "order_id": "ORD-4490",
     "customer_id": "CUST-Lee-Austin",

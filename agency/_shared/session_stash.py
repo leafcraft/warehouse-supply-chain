@@ -5,9 +5,9 @@ Two jobs, both keyed by session_id:
   * IDEMPOTENCY — a humanoid actuator must not double-dispatch the same
     pick/pack/load if the chain re-enters (e.g. a retried event). The
     dispatcher records the task key here and no-ops on a repeat.
-  * BOUNDED BACK-EDGES — the damage/short re-inspection loop is counted
-    and capped so a stuck item escalates instead of cycling forever
-    (the SDK chain cap would otherwise kill the session opaquely).
+  * COUNTERS — bump()/peek() for a bounded back-edge. The outbound chain
+    has none today (a failed inspection goes to the exception handler,
+    never back to the picker); use them if you add a loop.
 
 In-process dict keyed by session_id — single-replica dev default. For a
 multi-replica deployment, swap the primitives for Redis hashes (the

@@ -9,7 +9,7 @@
 > physical work; a carrier is rate-shopped; the **shipment dispatcher** (the
 > finisher) re-checks a release token, renders the shipping manifest, and hands
 > the carton to the loader. Standing supply-chain roles run alongside:
-> cycle-count / shrink control (parallel-instance fan-out), returns,
+> cycle-count / shrink control (parallel-copies fan-out), returns,
 > replenishment, supplier relations (super-agent), humanoid-fleet telemetry.
 > Every terminal action lands in a hash-chained WORM audit.
 >
@@ -54,7 +54,7 @@
  exception_agent ──(safety / sev≥0.7 / requires_sup)──▶ ops_supervisor_human               ▼
         └──(front-line)──▶ WORM                                                    shipment_dispatcher_agent
                                                                                     │ dispatched
- inventory_control_agent (instances fan-out; shrink floor)                          ▼
+ inventory_control_agent (copies fan-out; shrink floor)                             ▼
    ├─ max_variance>2% ──▶ exception_agent                                    loader_humanoid ──▶ WORM
    └─ systematic shrink / >20 over-tol ──▶ warehouse_manager_human
 
@@ -65,8 +65,10 @@
 
 Bounded by construction: forward-flow DAG; every branch terminates in the WORM
 audit; the coordinator orchestrates but never does specialist work; human gates
-(`ops_supervisor_human`, `warehouse_manager_human`) are **default-deny** on
-timeout (`held_for_review` → audit) and never call each other.
+(`ops_supervisor_human` 30 min, `warehouse_manager_human` 2h) never release or
+approve on silence — an unanswered request closes its Inbox card and the ticket
+records that no reply came — and never call each other (the supervisor's
+`escalate` goes through the Coordinator).
 
 ## 2. Actor inventory (job titles)
 
@@ -83,12 +85,12 @@ timeout (`held_for_review` → audit) and never call each other.
 | `shipment_dispatcher_agent` | Dispatch / shipping lead | programmatic **finisher** |
 | `loader_humanoid` | Dock loader (humanoid) | programmatic actor |
 | `returns_handler_agent` | Returns processor (WMS) | programmatic (store-grounded) |
-| `inventory_control_agent` | Cycle-count & shrink controller | programmatic + instances + wake_up |
+| `inventory_control_agent` | Cycle-count & shrink controller | programmatic + scaling.copies + wake_up |
 | `replenishment_planner_agent` | Replenishment / demand planner | programmatic (store-grounded) |
 | `supplier_relations_agent` | Supplier relationship manager | llm + super_agent + playbook + wake_up |
 | `humanoid_status_agent` | Robotics fleet ops monitor | programmatic |
-| `ops_supervisor_human` | Operations supervisor | human (HITL webhook) |
-| `warehouse_manager_human` | Warehouse manager | human (HITL webhook) |
+| `ops_supervisor_human` | Operations supervisor | human (Studio Inbox) |
+| `warehouse_manager_human` | Warehouse manager | human (Studio Inbox) |
 | `warehouse_audit_logger_agent` | Compliance / audit recorder | external `custom` (WORM) |
 
 ## 3. Data artifacts
@@ -110,7 +112,8 @@ timeout (`held_for_review` → audit) and never call each other.
   order; OUTPUT CONTRACT over `action / order_id / stage / waiting_on / summary`.
   `action == open_order` → allocation; `escalate` → the Warehouse Manager. Also
   consumes `orders.created` from a Redis stream via `listen_events` (BRD-021),
-  parallel to the `order_placed` webhook. Never allocates, picks, or releases.
+  parallel to the `order_placed` webhook — shipped commented; create vault
+  connection `order_events`, then uncomment the broker and `listen_events` (in Studio's raw YAML editor). Never allocates, picks, or releases.
 - **`allocation_agent`** (Python, deep): `@pre_compose load_fulfillment_context`
   pulls the order (hydrating from `order_id` alone), bins and free-stock
   availability; the body does bin-sort travel minimisation, batching and resource
@@ -121,7 +124,7 @@ timeout (`held_for_review` → audit) and never call each other.
 - **`inventory_agent`** (Python, store-grounded): reserves the pick plan against
   the seeded WMS; a shortage → `exception_agent`; a success is recorded to the
   WORM sink. Also absorbs an inbound restock. Announces `available: false` on an
-  unknown SKU. PROD: uncomment the WMS `mcp` block.
+  unknown SKU. PROD: uncomment the WMS connector block (`integration: mcp`, vault connection `wms_mcp`) — in Studio's raw YAML editor.
 - **`exception_agent`** (LLM, deep): `@pre_compose load_exception_context` pulls
   the order + affected SKU unit value + fleet unit; `@chain
   enforce_severity_floor` re-asserts the floors a prompt can't waive — safety
@@ -142,16 +145,17 @@ timeout (`held_for_review` → audit) and never call each other.
   pattern): sits behind the dispatch RELEASE gate. Recovers the carton across the
   HITL boundary (upstream → session stash → dev store) on the substantive
   `selected_carrier`, never a bare id. Routine cartons self-authorise on
-  deterministic invariants; a held / high-value carton routes to the Warehouse
+  deterministic invariants; a held carton, or one whose order's declared value
+  (Σ quantity × unit value, from the OMS) is $500 or more, routes to the Warehouse
   Manager (phase 1) and issues (phase 2) ONLY on an explicit release token
   (allowlist) — an unknown verdict **fails closed**. `@chain
   enforce_dispatch_floor`: re-check → invariants (carrier / SLA / real carton)
   → render the manifest to `./out` → **delete-on-block** → WORM ledger. A missing
   shipment record announces `available: false` — never a synthetic dispatch ack.
 - **`inventory_control_agent`** (Python, deep): mode-dispatched count / ingest /
-  report; **parallel `instances`** fan the nightly sweep across zones, each copy
+  report; **parallel copies** (`scaling.copies`) fan the nightly sweep across zones, each copy
   claiming a DISJOINT batch via the atomic `store.claim_count_batch`;
-  `instances_handoff: last` combines the copies (counts SUM correctly). The
+  `scaling.copies.handoff: last` combines the copies (counts SUM correctly). The
   per-copy `@chain enforce_shrink_floor` re-asserts the 2% tolerance +
   manager-attention floor on its own batch; the combined `max_variance_pct` is a
   summed ratio, so it is conservative — it can only over-escalate the `> 0.02`
@@ -179,27 +183,33 @@ timeout (`held_for_review` → audit) and never call each other.
 `carrier_outage_failover` (→ carrier); `humanoid_status` (→ fleet);
 `supplier_relations_onboarding` / `_sourcing` / `supplier_quarterly_scorecard`;
 `release_reply` / `supervisor_reply` (HITL resume); and per-agent `direct_call_*`.
-Plus the coordinator's `listen_events` on the OMS `orders.created` Redis stream.
+Plus the coordinator's `listen_events` on the OMS `orders.created` Redis stream
+(commented until vault connection `order_events` exists).
 
 ## 6. Controls / trust
 
 - **One human, one agent, one system per stage** — agents produce, humans decide,
   the WORM sink records. No stage advances on an agent's own authority.
 - **Every wire conditional** — no bare edges; the audit terminus uses `always`.
-- **Human gates default-deny** on timeout (`held_for_review` → audit); `dual`
-  lives on humans only and never `dual`→`dual` (escalation via the Manager).
+- **Nothing released on silence** — an unanswered request closes its Inbox card
+  and the ticket records that no reply came; nobody is chased automatically.
+  The seats keep `fallback_response` (`held_for_review` → audit) as the declared
+  intent; leafmesh 2.4.486 does not route it for dual seats yet. Every answer
+  value has a route. `dual` lives on humans only and never `dual`→`dual` (the
+  supervisor's `escalate` goes through the Coordinator).
 - **Deterministic floors** the LLM can't waive: availability gate, severity /
   safety floor, ship-readiness, rate-shop, shrink, and the finisher's
   release-token re-check + invariants + delete-on-block.
-- **Bounded loops** — the re-inspection / damage back-edge is counted in
-  `session_stash` so a stuck item escalates instead of cycling.
+- **No loops to bound** — the outbound chain is a forward DAG: a failed
+  inspection goes to the exception handler, never back to the picker.
+  `session_stash` keeps the picker's idempotency latch.
 - Hash-chained WORM audit terminus on every branch.
 - Manager escalation targets: `human_agent` (Warehouse Manager) → webhook
-  (PagerDuty).
+  (PagerDuty; commented until vault connection `escalation_webhook` exists).
 
 ## 7. Config pointer
 
-The department lives in `configs/config.yaml`; the depth lives in `agency/`.
+The department lives in the agency's configuration (`create-leafmesh --start` loads it into the store once; after that it is changed in Studio); the depth lives in `agency/`.
 Policy is enforced two ways: deterministic floors in Python `@chain`
 (availability, severity, ship-readiness, rate-shop, shrink, dispatch) AND
 readable wire conditions (`can_call`). The Python surface:
@@ -228,7 +238,7 @@ readable wire conditions (`can_call`). The Python surface:
   **finisher** (`shipment_dispatcher_agent`) that produces the real shipping
   artifact behind a human release gate and fails closed. Every other role does
   exactly one job.
-- **Modern capabilities, fitted to the domain.** `instances` fan the cycle-count
+- **Modern capabilities, fitted to the domain.** `scaling.copies` fan the cycle-count
   sweep across zones (each copy claims a disjoint batch); `super_agent` gives the
   supplier manager plan/execute/verify over trailing scorecards; `listen_events`
   lets the coordinator consume the OMS order stream; `timezone` pins both
@@ -237,14 +247,15 @@ readable wire conditions (`can_call`). The Python surface:
 - **Floors hold on every path.** The deterministic `@chain` floors re-run on
   direct calls too (bodies fall back to `input_data` when `@pre_compose` hasn't
   run), so a gate/threshold/rule can't be bypassed by invocation path.
-- **Day-0 usable.** A seeded dev store carries a realistic order, inventory with
-  a short and a high-value SKU, a humanoid fleet, a carrier table, and supplier
+- **Day-0 usable.** A seeded dev store carries three orders (routine $208,
+  short-stock, and a $595 carton that needs a release), inventory with a short
+  and a high-value SKU, a humanoid fleet, a carrier table, and supplier
   scorecards, so the FULL chain (incl. the availability-gate / exception /
   dispatch paths) runs with no connectors set — every stub announces itself.
 - **Systems are tools, not members.** WMS / TMS / ERP / fleet are commented `mcp`
   blocks + store-grounded bodies with a documented PROD swap; their `yields`
   blocks are the contract the gateway must return.
 - **`dual` discipline.** `dual` is on the two humans only; they never call each
-  other (a `dual`→`dual` edge auto-bounces, gotcha #17) — human→human escalation
-  goes through the Manager supervisor. Verified: the mesh loads on 2.4.131 with
+  other (a `dual`→`dual` edge auto-bounces, gotcha #17) — the supervisor's
+  escalation goes through the Coordinator. Verified: the mesh loads on 2.4.131 with
   **zero dual warnings**.

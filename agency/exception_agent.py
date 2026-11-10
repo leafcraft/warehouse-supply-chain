@@ -24,7 +24,7 @@ DEEP (self-reliant + deterministic severity/safety floor):
 
 KEPT AS PYTHON (the floor): warehouse loss/safety policy is a deterministic
 control that belongs to this mesh, not to a prompt a model can talk itself
-out of. The four exception classes and the wire conditions in config.yaml
+out of. The four exception classes and the wire conditions in the configuration
 mirror these same floors.
 """
 from __future__ import annotations

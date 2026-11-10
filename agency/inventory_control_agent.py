@@ -5,7 +5,7 @@ DEEP (store-grounded + deterministic shrink floor):
 @pre_compose  load_count_context — pull the SKU master (zones/bins/system
               on-hand) from the source store BEFORE reconciliation. In dev
               from agency/_shared/store.py (seeded); in prod from the WMS
-              (${WMS_MCP_URL}, tool get_cycle_count_results). Self-reliant:
+              (vault connection wms_mcp, tool get_cycle_count_results). Self-reliant:
               the controller fetches the authoritative on-hand itself.
 
 @chain        enforce_shrink_floor — the deterministic SHRINK / CYCLE-COUNT
@@ -17,7 +17,7 @@ DEEP (store-grounded + deterministic shrink floor):
               shrink event through.
 
 Mode-dispatched (count | ingest | report). The MCP path is the prod swap
-(point ${WMS_MCP_URL} at your WMS); the dev body reconciles the seeded
+(the wms_mcp vault connection on your WMS); the dev body reconciles the seeded
 counts so the chain runs day-0.
 """
 from __future__ import annotations

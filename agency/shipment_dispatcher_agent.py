@@ -78,10 +78,16 @@ def _is_blocked(input_data: dict) -> bool:
 
 
 def _needs_human_release(carton: dict) -> bool:
-    """A held / high-value carton cannot be self-authorised on the routine path."""
+    """A held / high-value carton cannot be self-authorised on the routine path.
+    Fail closed: a carton whose declared value is unknown (no order on record,
+    no priced lines) is treated as high-value and goes to the manager."""
     if str(carton.get("hold") or carton.get("held") or "").lower() in ("1", "true", "yes"):
         return True
-    return int(carton.get("value_cents") or 0) >= HIGH_VALUE_CENTS
+    try:
+        value = int(carton.get("value_cents") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value <= 0 or value >= HIGH_VALUE_CENTS
 
 
 def _render_manifest(carton: dict) -> str:
@@ -109,14 +115,58 @@ def _delete_partial(result: dict) -> None:
         result["manifest_path"] = ""
 
 
+def _order_id_from(input_data: dict) -> str:
+    """The order id wherever the chain carried it: the input itself, flat
+    upstream yields, or one agent's yields (allocation_agent yields it)."""
+    if not isinstance(input_data, dict):
+        return ""
+    if input_data.get("order_id"):
+        return str(input_data["order_id"])
+    up = input_data.get("upstream_yields") or {}
+    if isinstance(up, dict):
+        if up.get("order_id"):
+            return str(up["order_id"])
+        for v in up.values():
+            if isinstance(v, dict) and v.get("order_id"):
+                return str(v["order_id"])
+    return ""
+
+
+def _with_order_value(carton: dict, input_data: dict | None = None) -> dict:
+    """Fill the order id (from the packer's shipment record, else from the
+    chain's upstream yields) and the declared value (from the order lines) —
+    the release gate reads value_cents, and the carrier's output carries
+    neither."""
+    carton = dict(carton)
+    cid = str(carton.get("carton_id") or "")
+    if cid and not carton.get("order_id"):
+        rec = store.get_shipment(cid)
+        if rec.get("order_id"):
+            carton["order_id"] = rec["order_id"]
+        if rec.get("weight_kg") and not carton.get("weight_kg"):
+            carton["weight_kg"] = rec["weight_kg"]
+    if not carton.get("order_id"):
+        oid = _order_id_from(input_data or {})
+        if oid:
+            carton["order_id"] = oid
+    if carton.get("order_id") and not carton.get("value_cents"):
+        carton["value_cents"] = store.order_value_cents(str(carton["order_id"]))
+    return carton
+
+
 def _recover_carton(input_data: dict, context: dict) -> dict:
     """Recover the FULL carton across the HITL boundary: upstream -> stash -> dev
     store. Match on the substantive field (selected_carrier), never a bare
     carton_id — after the release gate the human reply carries only the verdict +
     id, so trusting a thin payload with an id would skip the real record."""
+    return _with_order_value(_recover_carton_raw(input_data, context), input_data)
+
+
+def _recover_carton_raw(input_data: dict, context: dict) -> dict:
     up = input_data.get("upstream_yields") or {}
     candidates = [input_data]
     if isinstance(up, dict):
+        candidates.append(up)                       # flat upstream yields
         candidates.append(up.get("carrier_selector_agent"))
         candidates.extend(v for v in up.values() if isinstance(v, dict))
     for src in candidates:
