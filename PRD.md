@@ -64,10 +64,10 @@
 ```
 
 Bounded by construction: forward-flow DAG; every branch terminates in the WORM
-audit; the coordinator orchestrates but never does specialist work; human gates
+audit; the coordinator orchestrates but never does specialist work; human steps
 (`ops_supervisor_human` 30 min, `warehouse_manager_human` 2h) never release or
-approve on silence — an unanswered request closes its Inbox card and the ticket
-records that no reply came — and never call each other (the supervisor's
+approve on silence — an unanswered request's default reply (`hold`) goes to the
+audit log — and never call each other (the supervisor's
 `escalate` goes through the Coordinator).
 
 ## 2. Actor inventory (job titles)
@@ -191,12 +191,11 @@ Plus the coordinator's `listen_events` on the OMS `orders.created` Redis stream
 - **One human, one agent, one system per stage** — agents produce, humans decide,
   the WORM sink records. No stage advances on an agent's own authority.
 - **Every wire conditional** — no bare edges; the audit terminus uses `always`.
-- **Nothing released on silence** — an unanswered request closes its Inbox card
-  and the ticket records that no reply came; nobody is chased automatically.
-  The seats keep `fallback_response` (`held_for_review` → audit) as the declared
-  intent; leafmesh 2.4.486 does not route it for dual seats yet. Every answer
-  value has a route. `dual` lives on humans only and never `dual`→`dual` (the
-  supervisor's `escalate` goes through the Coordinator).
+- **Nothing released on silence** — an unanswered request's `fallback_response`
+  (`verdict: hold`, `held_for_review`) goes through the seat's routes like any
+  reply and lands in audit; nobody is chased automatically. Every verdict has a
+  route; `answer` goes back to only the agent that asked. Humans never call
+  each other (the supervisor's `escalate` goes through the Coordinator).
 - **Deterministic floors** the LLM can't waive: availability gate, severity /
   safety floor, ship-readiness, rate-shop, shrink, and the finisher's
   release-token re-check + invariants + delete-on-block.
@@ -255,7 +254,7 @@ readable wire conditions (`can_call`). The Python surface:
 - **Systems are tools, not members.** WMS / TMS / ERP / fleet are commented `mcp`
   blocks + store-grounded bodies with a documented PROD swap; their `yields`
   blocks are the contract the gateway must return.
-- **`dual` discipline.** `dual` is on the two humans only; they never call each
-  other (a `dual`→`dual` edge auto-bounces, gotcha #17) — the supervisor's
-  escalation goes through the Coordinator. Verified: the mesh loads on 2.4.131 with
-  **zero dual warnings**.
+- **Seat discipline.** Every agent is `chain`; the two humans each have a
+  `reply_reader` (`gpt-4o-mini`) that turns the typed reply into a `verdict`.
+  They never call each other — the supervisor's escalation goes through the
+  Coordinator.

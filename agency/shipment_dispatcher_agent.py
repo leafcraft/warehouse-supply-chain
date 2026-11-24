@@ -14,7 +14,7 @@ the concrete "@chain fails closed":
      real carton with a known weight).
   c) render the real manifest to ./out; on a tripped floor, DELETE the partial
      and record status: blocked with reasons — never a half-issued shipment.
-  d) dev-store recovery — after the HITL gate the upstream payload is dropped, so
+  d) dev-store recovery — after the human step the upstream payload is dropped, so
      the dispatcher recovers the carton from the session stash / dev store, and
      ANNOUNCES available:false when there is genuinely no shipment record.
 
@@ -58,7 +58,7 @@ def _signal(input_data: dict) -> str:
     if isinstance(up, dict):
         sources.extend(v for v in up.values() if isinstance(v, dict))
     for src in sources:
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()

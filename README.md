@@ -29,8 +29,8 @@ real release token** before it issues a manifest — a carton worth $500 or more
 Warehouse Manager's release — and
 **deletes a half-issued shipment** if its floor trips; **cycle-count fans out across zones** with each
 copy claiming a disjoint batch, and the shrink floor re-asserts the 2% tolerance.
-**Silence never advances an order**: a request nobody answers closes its Inbox
-card and the ticket records that no reply came — nothing is released on
+**Silence never advances an order**: a request nobody answers takes the seat's
+default reply, `hold`, to the audit log — nothing is released on
 silence. Every pick, pack, ship, exception,
 humanoid action, and held gate is hash-chained in a WORM ledger. Humanoids
 (projected $3–8/hr) do the physical share; the agents do the judgment and the
@@ -40,7 +40,7 @@ paperwork.
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `fulfillment_coordinator_agent` | Fulfilment Coordinator | Owns the order end to end; opens it, keeps live status, is the single contact | LLM; orchestrates allocation→…→dispatch; **listen_events** on OMS order stream (commented until vault connection `order_events` exists); escalates to the Warehouse Manager; **never allocates, picks, or releases** |
+| `fulfillment_coordinator_agent` | Fulfilment Coordinator | Owns the order end to end; opens it, keeps live status, is the single contact | LLM + **playbook**; orchestrates allocation→…→dispatch; **listen_events** on OMS order stream (commented until vault connection `order_events` exists); escalates to the Warehouse Manager; **never allocates, picks, or releases** |
 | `allocation_agent` | Slotting & Pick Planner | Pick path, batching, priority + travel-minimised route in one step | Programmatic; `@pre_compose` pulls order+bins; `@chain` **availability gate** (no dispatch on short stock) |
 | `inventory_agent` | Stock Controller | Confirms stock + reserves units; absorbs inbound restock | Programmatic; store-grounded day-0; shortage → exception; commented WMS `mcp` |
 | `exception_agent` | Exceptions Analyst | Classifies short-pick / damage / wrong-item / safety and briefs the floor | LLM + **playbook**; `@pre_compose` pulls order+value+unit; `@chain` **severity/safety floor** (fail closed) |
@@ -55,8 +55,8 @@ paperwork.
 | `replenishment_planner_agent` | Replenishment Planner | Reorder recommendations off the SKU master; critical-stockout flag | Programmatic; store-grounded day-0; commented ERP `mcp` |
 | `supplier_relations_agent` | Supplier Relationship Manager | Onboarding gates, alternate sourcing, quarterly scorecards | LLM + **super_agent** + **playbook** + dev-store lookup tools; `@pre_compose` pulls scorecards+history; **wake_up**/**timezone** |
 | `humanoid_status_agent` | Fleet Telemetry | Humanoid battery / fault / location telemetry | Programmatic; fault → Ops Supervisor |
-| `ops_supervisor_human` | Ops Supervisor (Human) | Floor decisions, exceptions, safety, humanoid faults | Human gate (Studio Inbox), **30 min** — resolved / held_for_review → audit; escalate → the Coordinator, which hands it to the Warehouse Manager |
-| `warehouse_manager_human` | Warehouse Manager (Human) | Accountable owner: dispatch release of a $500+ carton, supplier gates, shrink | Human gate (Studio Inbox), **2h** (inside the day's carrier cut-off) — approved on a dispatch release → dispatcher; every other answer (approved / rejected / held_for_review) → audit |
+| `ops_supervisor_human` | Ops Supervisor (Human) | Floor decisions, exceptions, safety, humanoid faults | Human step (Studio Inbox), **30 min** — verdict `resolved` / `hold` → audit; `escalate` → the Coordinator, which hands it to the Warehouse Manager |
+| `warehouse_manager_human` | Warehouse Manager (Human) | Accountable owner: dispatch release of a $500+ carton, supplier gates, shrink | Human step (Studio Inbox), **2h** (inside the day's carrier cut-off) — verdict `approve` on a dispatch release → dispatcher; every other verdict (`approve` elsewhere / `reject` / `hold`) → audit |
 | `warehouse_audit_logger_agent` | WORM audit | Hash-chains every pick, pack, ship, exception, humanoid action, and held gate | External (custom sink); terminus |
 
 The **LeafMesh Manager** supervises; it is not a router in the middle of the
@@ -64,16 +64,21 @@ team. It escalates to the Warehouse Manager on a non-retryable error (auth, a
 bad request, credit, bad config), when 3 different agents fail in one order, or
 when restarts run out; a malformed hand-off only raises an alert. Safety /
 damage / high-value exceptions reach the Ops Supervisor, and systematic shrink
-reaches the Warehouse Manager, through the team's own wires. Human gates never
-call each other (a `dual`→`dual` edge auto-bounces); a supervisor's
-`escalate` goes through the Coordinator.
+reaches the Warehouse Manager, through the team's own wires. Human steps never
+call each other; a supervisor's `escalate` goes through the Coordinator.
+
+**How a person replies.** The Inbox has no buttons. The person types a reply,
+and a small reply reader (`gpt-4o-mini`) turns it into one of the seat's
+verdicts in the table above. Anything that is not a clear decision — no, not
+now, wait — reads as `hold`. If the person answered an agent's question instead
+of deciding, the verdict is `answer` and it goes back to only the agent that
+asked.
 
 **If nobody answers.** Each human request waits for the time in the table
-above. If nobody answers within it, the request waits no longer: its Inbox card
-closes and the ticket records that no reply came. Nothing is released or
-approved on silence, and nobody is chased automatically. (Each seat's
-`fallback_response` — `held_for_review` → audit — states the intended
-default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
+above. If nobody answers within it, the seat's default reply
+(`fallback_response`: `verdict: hold`, `held_for_review`) goes through its
+routes like any reply and is recorded in the audit log. Nothing is released or
+approved on silence, and nobody is chased automatically.
 
 ## Configuration — what to set, in three tiers
 
@@ -85,7 +90,7 @@ carrier rates, supplier scorecards, and the humanoid fleet are dev stand-ins tha
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | Coordinator + exception + supplier + Manager (`gpt-4o-mini`) | **Required** unless you change the models. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |
 | *(no setting)* — human members | Human approvals | Answer in Studio's Inbox. To notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |

@@ -29,7 +29,7 @@ response, and uncomment the matching connector block (in Studio's raw YAML edito
 To see the dispatch release gate, place `ORD-4512` (5 × trail runners, $595):
 its carton waits for the Warehouse Manager's release in Studio → Inbox.
 
-## Human gates
+## Human steps
 
 If nobody answers a request in time, its Inbox card closes and the ticket
 records that no reply came — nothing is released on silence.
